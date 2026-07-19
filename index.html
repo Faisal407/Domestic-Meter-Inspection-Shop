@@ -1422,6 +1422,7 @@ function doGet(e) {
         <button data-val="1" data-default="true">Model 1 — Forenoon / Afternoon / Overtime</button>
         <button data-val="2">Model 2 — Custom blocks</button>
       </div>
+      <div class="subtext" style="margin-top:6px;">Tap "Model 2" above to reveal the 1/2/3 hour block-size choice — it's hidden until Model 2 is selected.</div>
       <div id="asgGranularityWrap" style="display:none; margin-top:8px;">
         <label class="field-label">Block size</label>
         <div class="chip-grid" id="asgGranularityChips">
@@ -1444,14 +1445,10 @@ function doGet(e) {
 
     <div class="card">
       <h2>Today's Assignment</h2>
-      <div class="subtext">Tap a row to assign or reassign. Group two or more people on the same task by
-        selecting them together — pulling one out later leaves the rest of the group untouched.</div>
-      <div id="asgTableWrap" class="table-wrap">
-        <table class="records" id="asgTable">
-          <thead><tr><th>Slot</th><th>Employee</th><th>Task</th><th>Work Done</th><th></th></tr></thead>
-          <tbody id="asgTableBody"></tbody>
-        </table>
-      </div>
+      <div class="subtext">Tap "✏ Assign / Reassign" on a person to set or change their task. To group two or
+        more people on the same task, tick their names together in that screen — pulling one out later
+        leaves the rest of the group untouched.</div>
+      <div id="asgTableWrap" style="display:flex; flex-direction:column; gap:10px;"></div>
       <div class="row" style="margin-top:10px;">
         <button class="btn outline" onclick="asgPrintDate()">🖨 Print This Date</button>
         <button class="btn outline" onclick="asgLoadDate()">🔄 Refresh</button>
@@ -1931,7 +1928,12 @@ function output(result, callback) {
     <h3 id="asgAssignModalTitle">Assign Task</h3>
     <label class="field-label">Task</label>
     <textarea id="asgAssignTaskText" rows="2" placeholder="What are they assigned to do?"></textarea>
-    <label class="field-label" id="asgAssignEmployeesLabel">Employee(s) — select one or more to group them together</label>
+    <div class="subtext" style="margin-top:8px;">
+      <b>To group people on one task:</b> tap each of their names below so all the ones doing this
+      together are highlighted, then Save. Only the person you opened this from is pre-selected —
+      tap others to add them to the group.
+    </div>
+    <label class="field-label" id="asgAssignEmployeesLabel">Employee(s)</label>
     <div id="asgAssignEmployeeChips" class="chip-grid"></div>
     <button class="btn amber" style="margin-top:10px;" onclick="asgSubmitAssign()">Save Assignment</button>
     <button class="btn outline" onclick="closeAsgAssignModal()">Cancel</button>
@@ -4691,29 +4693,33 @@ function asgFindAssignment(slot, employee){
   return asgAssignments.find(r=>r.slot===slot && r.employee===employee);
 }
 function asgRenderTable(){
-  const tbody = document.getElementById('asgTableBody');
-  if(!asgActiveSection || !document.getElementById('asgDate').value){ tbody.innerHTML=''; return; }
+  const wrap = document.getElementById('asgTableWrap');
+  if(!asgActiveSection || !document.getElementById('asgDate').value){ wrap.innerHTML=''; return; }
   const slots = computeSlotsForDate(document.getElementById('asgDate').value, asgSlotModel, asgGranularity);
-  if(asgRoster.length===0){ tbody.innerHTML = '<tr><td colspan="5" style="color:var(--warn); font-weight:600;">⚠ No one on the roster yet — type a name in the "Roster" box above and tap Add. Assign/Reassign buttons appear here, one row per person per slot, right after.</td></tr>'; return; }
-  let rows = '';
+  if(asgRoster.length===0){
+    wrap.innerHTML = '<div class="banner" style="background:#fde3e0; border-color:#f0aca0; color:#7a1d10;">⚠ No one on the roster yet — type a name in the "Roster" box above and tap Add. Assign/Reassign controls appear here, one card per person per slot, right after.</div>';
+    return;
+  }
+  let html = '';
   slots.forEach(slot=>{
     asgRoster.forEach(emp=>{
       const a = asgFindAssignment(slot, emp);
-      const groupNote = a && a.groupTag ? ' <span style="color:var(--muted); font-size:11px;">(grouped)</span>' : '';
-      rows += `<tr>
-        <td>${slot}</td><td>${emp}</td>
-        <td>${a && a.task ? a.task+groupNote : '<span style="color:var(--muted);">— not assigned —</span>'}</td>
-        <td><div class="row" style="margin:0;">
-          <input type="text" value="${a && a.workDone ? a.workDone.replace(/"/g,'&quot;') : ''}" id="asgProg-${btoa(unescape(encodeURIComponent(slot+'|'+emp))).replace(/[^a-zA-Z0-9]/g,'')}" placeholder="Work done…" style="margin-top:0;">
-        </div></td>
-        <td style="white-space:nowrap;">
-          <button class="pill-btn secondary" style="padding:4px 8px; margin-right:4px;" onclick="asgOpenAssignModal('${slot.replace(/'/g,"\\'")}','${emp.replace(/'/g,"\\'")}')" title="Assign/Reassign">✏</button>
-          <button class="pill-btn secondary" style="padding:4px 8px;" onclick="asgSaveProgressForRow('${slot.replace(/'/g,"\\'")}','${emp.replace(/'/g,"\\'")}')" title="Save Progress">💾</button>
-        </td>
-      </tr>`;
+      const groupNote = a && a.groupTag ? ' <span style="color:var(--muted); font-size:11.5px;">(grouped with others)</span>' : '';
+      const fieldId = 'asgProg-' + btoa(unescape(encodeURIComponent(slot+'|'+emp))).replace(/[^a-zA-Z0-9]/g,'');
+      html += `<div class="pc-cloud" style="margin:0;">
+        <div class="pc-meta" style="margin-bottom:4px;">${slot}</div>
+        <div class="pc-name" style="font-size:16px;">${emp}</div>
+        <div style="margin:6px 0 10px; font-size:14px;">${a && a.task ? '📌 '+a.task+groupNote : '<span style="color:var(--muted);">— not assigned yet —</span>'}</div>
+        <button class="btn amber small" onclick="asgOpenAssignModal('${slot.replace(/'/g,"\\'")}','${emp.replace(/'/g,"\\'")}')">✏ Assign / Reassign</button>
+        <label class="field-label" style="margin-top:10px;">Work Done</label>
+        <div class="row">
+          <input type="text" value="${a && a.workDone ? a.workDone.replace(/"/g,'&quot;') : ''}" id="${fieldId}" placeholder="What did they do…">
+          <button class="btn outline small" style="flex:0 0 70px;" onclick="asgSaveProgressForRow('${slot.replace(/'/g,"\\'")}','${emp.replace(/'/g,"\\'")}')">💾 Save</button>
+        </div>
+      </div>`;
     });
   });
-  tbody.innerHTML = rows;
+  wrap.innerHTML = html;
 }
 function asgOpenAssignModal(slot, employee){
   asgAssignCtx = { slot };
