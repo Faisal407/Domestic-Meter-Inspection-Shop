@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1433,11 +1434,23 @@ function doGet(e) {
 
   <div class="card">
     <h2>Assignment Sheet &amp; Script</h2>
-    <label class="field-label">Assignment Google Sheet ID (its own, separate from Receiving/List Prep)</label>
+    <div class="banner info" style="margin-top:4px;">
+      Kept as two separate Sheets on purpose — put this one in an "Assignment/Duties" Drive folder shared
+      normally, and the Auth Sheet below in a second, more tightly restricted folder (Drive → right-click the
+      folder → Share → keep it Restricted to just yourself). Google Drive doesn't do file passwords, but
+      Restricted sharing is the real equivalent — only people you explicitly add can open it.
+    </div>
+    <label class="field-label">Assignment Google Sheet ID (daily Roster/Assignments/Log — the working data)</label>
     <div class="qr-field-row">
       <input type="text" id="asgSheetIdInput" placeholder="Sheet ID from its URL">
       <button type="button" class="btn outline qr-field-btn" onclick="openGenericQrScanner('asgSheetIdInput')" title="Scan QR to fill">📷</button>
       <button type="button" class="btn outline qr-field-btn" onclick="showFieldAsQr('asgSheetIdInput','Assignment Sheet ID')" title="Show as QR">⊞</button>
+    </div>
+    <label class="field-label">Auth Google Sheet ID (holds the TOTP secrets — keep this one the most restricted)</label>
+    <div class="qr-field-row">
+      <input type="text" id="asgAuthSheetIdInput" placeholder="A separate, more restricted Sheet ID">
+      <button type="button" class="btn outline qr-field-btn" onclick="openGenericQrScanner('asgAuthSheetIdInput')" title="Scan QR to fill">📷</button>
+      <button type="button" class="btn outline qr-field-btn" onclick="showFieldAsQr('asgAuthSheetIdInput','Auth Sheet ID')" title="Show as QR">⊞</button>
     </div>
     <label class="field-label">Assignment Apps Script Web App URL (its own — separate deployment)</label>
     <div class="qr-field-row">
@@ -1449,10 +1462,12 @@ function doGet(e) {
     <div class="ocr-status" id="asgConfigStatus"></div>
 
     <p style="font-size:13.5px; line-height:1.55; margin-top:14px;">
-      <b>1.</b> Create one new, blank Google Sheet — just for this activity.<br>
-      <b>2.</b> Go to <code>script.google.com</code> → New project → paste the code below exactly as-is.<br>
+      <b>1.</b> Create two new, blank Google Sheets — one for daily data, one just for Auth — in their
+      two separate Drive folders.<br>
+      <b>2.</b> Go to <code>script.google.com</code> → New project → paste the code below exactly as-is —
+      one script serves both Sheets, since the ID is sent with each request.<br>
       <b>3.</b> Deploy → New deployment → Web app → Execute as: Me → Access: Anyone → Deploy.<br>
-      <b>4.</b> Paste the Sheet ID and Script URL above, tap Save.
+      <b>4.</b> Paste both Sheet IDs and the Script URL above, tap Save.
     </p>
     <textarea readonly rows="60" class="mono" style="font-size:11px; white-space:pre;" id="asgScriptCodeBox">// ===== DMIS Assignment / Duties Script =====
 // Real TOTP (Google Authenticator) verification happens entirely here, server-side.
@@ -1482,9 +1497,9 @@ function doGet(e) {
   var callback = p.callback;
   var a = p.action;
   var result;
-  if (a === 'listAuthPeople')      result = listAuthPeople(p.sheetId);
+  if (a === 'listAuthPeople')      result = listAuthPeople(p.authSheetId);
   else if (a === 'verifyTotp')     result = verifyTotpLogin(p);
-  else if (a === 'enrollPerson')   result = enrollPerson({ sheetId:p.sheetId, personLabel:p.personLabel, role:p.role, allowedSections:(p.allowedSections||'').split(',').filter(Boolean) });
+  else if (a === 'enrollPerson')   result = enrollPerson({ authSheetId:p.authSheetId, personLabel:p.personLabel, role:p.role, allowedSections:(p.allowedSections||'').split(',').filter(Boolean) });
   else if (a === 'revokePerson')   result = revokePerson(p);
   else if (a === 'getRoster')      result = withSession(p, function(sess){ return { roster: getRoster(p.sheetId, sess.section) }; });
   else if (a === 'getAssignments') result = withSession(p, function(sess){ return { rows: getAssignments(p.sheetId, sess.section, p.date) }; });
@@ -1603,7 +1618,7 @@ function enrollPerson(data) {
   var lock = LockService.getScriptLock();
   try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
   try {
-    var sheet = getAuthSheet(data.sheetId);
+    var sheet = getAuthSheet(data.authSheetId);
     var vals = sheet.getDataRange().getValues();
     for (var i = 1; i < vals.length; i++) {
       if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
@@ -1618,7 +1633,7 @@ function enrollPerson(data) {
   } finally { lock.releaseLock(); }
 }
 function revokePerson(data) {
-  var sheet = getAuthSheet(data.sheetId);
+  var sheet = getAuthSheet(data.authSheetId);
   var vals = sheet.getDataRange().getValues();
   for (var i = 1; i < vals.length; i++) {
     if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
@@ -1628,8 +1643,8 @@ function revokePerson(data) {
   }
   return { status: 'error', message: 'Person not found.' };
 }
-function listAuthPeople(sheetId) {
-  var sheet = getAuthSheet(sheetId);
+function listAuthPeople(authSheetId) {
+  var sheet = getAuthSheet(authSheetId);
   var vals = sheet.getDataRange().getValues();
   var list = [];
   for (var i = 1; i < vals.length; i++) {
@@ -1639,7 +1654,7 @@ function listAuthPeople(sheetId) {
   return { people: list };
 }
 function verifyTotpLogin(data) {
-  var sheet = getAuthSheet(data.sheetId);
+  var sheet = getAuthSheet(data.authSheetId);
   var vals = sheet.getDataRange().getValues();
   for (var i = 1; i < vals.length; i++) {
     if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
@@ -1867,6 +1882,7 @@ function output(result, callback) {
     <div style="display:flex; justify-content:center; margin:14px 0;">
       <canvas id="asgEnrollQrCanvas" style="max-width:100%; border-radius:10px;"></canvas>
     </div>
+    <div class="ocr-status" id="asgEnrollQrStatus"></div>
     <label class="field-label">Secret (fallback if scanning fails)</label>
     <div class="code-box"><span class="code" id="asgEnrollSecretText" style="font-size:12px; word-break:break-all;"></span></div>
     <button class="btn outline" onclick="closeAsgEnrollResult()">Done — I've scanned it</button>
@@ -4752,8 +4768,16 @@ function asgEnrollPerson(){
     document.getElementById('asgEnrollSecretText').textContent = data.secret;
     document.getElementById('asgEnrollResultModal').classList.add('open');
     const canvas = document.getElementById('asgEnrollQrCanvas');
+    const qrStatusEl = document.getElementById('asgEnrollQrStatus');
+    canvas.style.display = 'none';
+    qrStatusEl.textContent = 'Generating QR code…';
     if(window.QRCode){
-      QRCode.toCanvas(canvas, data.otpauthUri, { width:280, margin:4, errorCorrectionLevel:'M' }, ()=>{});
+      QRCode.toCanvas(canvas, data.otpauthUri, { width:280, margin:4, errorCorrectionLevel:'M' }, function(err){
+        if(err){ canvas.style.display = 'none'; qrStatusEl.textContent = '⚠ Could not draw the QR code — use the secret text below instead.'; }
+        else { canvas.style.display = 'block'; qrStatusEl.textContent = ''; }
+      });
+    } else {
+      qrStatusEl.textContent = '⚠ QR code library did not load (try a hard refresh) — use the secret text below instead.';
     }
     asgLoadPeopleList();
     asgLoadPeopleListForLogin();
