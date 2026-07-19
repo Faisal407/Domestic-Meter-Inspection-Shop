@@ -1444,11 +1444,22 @@ function doGet(e) {
     </div>
 
     <div class="card">
+      <h2>Teams (optional — set up groups once, reuse every day)</h2>
+      <div class="subtext">Create a team here first if the same people regularly work together — it then
+        shows as its own row in the table below, and assigning it assigns everyone in it at once.</div>
+      <label class="field-label">Team Name</label>
+      <input type="text" id="asgNewTeamName" placeholder="e.g. Team A">
+      <label class="field-label">Members (tap to select two or more)</label>
+      <div id="asgTeamMemberChips" class="chip-grid"></div>
+      <button class="btn outline small" style="margin-top:8px;" onclick="asgCreateTeam()">Save Team</button>
+      <div class="ocr-status" id="asgTeamStatus"></div>
+    </div>
+
+    <div class="card">
       <h2>Today's Assignment</h2>
-      <div class="subtext">Tap "✏ Assign / Reassign" on a person to set or change their task. To group two or
-        more people on the same task, tick their names together in that screen — pulling one out later
-        leaves the rest of the group untouched.</div>
-      <div id="asgTableWrap" style="display:flex; flex-direction:column; gap:10px;"></div>
+      <div class="subtext">Tap any cell to assign or reassign that slot. Team rows assign everyone in the
+        team at once. If there are more time slots than fit your screen, swipe/scroll the table sideways →</div>
+      <div id="asgTableWrap" class="table-wrap"></div>
       <div class="row" style="margin-top:10px;">
         <button class="btn outline" onclick="asgPrintDate()">🖨 Print This Date</button>
         <button class="btn outline" onclick="asgLoadDate()">🔄 Refresh</button>
@@ -1522,6 +1533,7 @@ function doPost(e) {
   if (a === 'reassignEmployee')  return output(reassignEmployee(data));
   if (a === 'saveProgress')      return output(saveProgress(data));
   if (a === 'saveSlotModel')     return output(saveSlotModel(data));
+  if (a === 'createTeam')        return output(createTeam(data));
   return output({status:'error', message:'Unknown action'});
 }
 
@@ -1538,6 +1550,7 @@ function doGet(e) {
   else if (a === 'getAssignments') result = withSession(p, function(sess){ return { rows: getAssignments(p.sheetId, sess.section, p.date) }; });
   else if (a === 'getSlotModel')   result = withSession(p, function(sess){ return getSlotModel(p.sheetId, sess.section); });
   else if (a === 'getLog')         result = withSession(p, function(sess){ return { rows: getLog(p.sheetId, sess.section, p.date) }; });
+  else if (a === 'getTeams')       result = withSession(p, function(sess){ return { teams: getTeams(p.sheetId, sess.section) }; });
   else result = { status: 'error', message: 'Unknown action' };
   return output(result, callback);
 }
@@ -1756,6 +1769,51 @@ function saveSlotModel(data) {
 }
 
 /* ============================================================
+   Teams — pre-defined groups of roster members, one row per team,
+   per section. Assigning a team to a slot is exactly like a group
+   assignment, just with membership decided ahead of time.
+   ============================================================ */
+function getTeamsSheet(sheetId, section) {
+  var ss = SpreadsheetApp.openById(sheetId);
+  var name = 'Teams - ' + section;
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(['Team Name', 'Members']);
+    sheet.getRange(1,1,1,2).setFontWeight('bold');
+  }
+  return sheet;
+}
+function getTeams(sheetId, section) {
+  var sheet = getTeamsSheet(sheetId, section);
+  var vals = sheet.getDataRange().getValues();
+  var teams = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (!vals[i][0]) continue;
+    teams.push({ teamName: vals[i][0], members: String(vals[i][1] || '').split(',').map(function(s){ return s.trim(); }).filter(Boolean) });
+  }
+  return teams;
+}
+function createTeam(data) {
+  return withSession(data, function(sess){
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
+    try {
+      var sheet = getTeamsSheet(data.sheetId, data.section);
+      var vals = sheet.getDataRange().getValues();
+      var rowIdx = -1;
+      for (var i = 1; i < vals.length; i++) {
+        if (String(vals[i][0]).trim().toLowerCase() === String(data.teamName).trim().toLowerCase()) { rowIdx = i + 1; break; }
+      }
+      var membersStr = (data.members || []).join(',');
+      if (rowIdx === -1) sheet.appendRow([data.teamName, membersStr]);
+      else sheet.getRange(rowIdx, 1, 1, 2).setValues([[data.teamName, membersStr]]);
+      return { status: 'ok' };
+    } finally { lock.releaseLock(); }
+  });
+}
+
+/* ============================================================
    Assignments — current-state tab, printable.
    Date | Slot | Employee | Group Tag | Assigned Task | Assigned At |
    Assigned By | Times Reassigned | Work Done | Progress Entered At | Remarks
@@ -1928,6 +1986,8 @@ function output(result, callback) {
     <h3 id="asgAssignModalTitle">Assign Task</h3>
     <label class="field-label">Task</label>
     <textarea id="asgAssignTaskText" rows="2" placeholder="What are they assigned to do?"></textarea>
+    <label class="field-label">Work Done (optional — fill in later, or now if already known)</label>
+    <textarea id="asgAssignWorkDoneText" rows="2" placeholder="What did they actually do…"></textarea>
     <div class="subtext" style="margin-top:8px;">
       <b>To group people on one task:</b> tap each of their names below so all the ones doing this
       together are highlighted, then Save. Only the person you opened this from is pre-selected —
@@ -1935,7 +1995,7 @@ function output(result, callback) {
     </div>
     <label class="field-label" id="asgAssignEmployeesLabel">Employee(s)</label>
     <div id="asgAssignEmployeeChips" class="chip-grid"></div>
-    <button class="btn amber" style="margin-top:10px;" onclick="asgSubmitAssign()">Save Assignment</button>
+    <button class="btn amber" style="margin-top:10px;" onclick="asgSubmitAssign()">Save</button>
     <button class="btn outline" onclick="closeAsgAssignModal()">Cancel</button>
   </div>
 </div>
@@ -4504,6 +4564,7 @@ function exportListPrepExcel(id){
    ============================================================ */
 const ASG_SECTIONS = ['Inspection & Flow Proving', 'MR/MRV & MIR'];
 let assignmentSheetId = '';
+let authSheetId = '';
 let assignmentScriptUrl = '';
 let asgSessionToken = null;
 let asgSession = null;
@@ -4513,11 +4574,12 @@ let asgGranularity = 2;
 let asgRoster = [];
 let asgAssignments = [];
 let asgAssignCtx = null;
+let asgTeams = [];
 
 function asgInit(){
   const dateEl = document.getElementById('asgDate');
   if(dateEl && !dateEl.value) dateEl.value = new Date().toISOString().slice(0,10);
-  if(assignmentSheetId) asgLoadPeopleListForLogin();
+  if(authSheetId) asgLoadPeopleListForLogin();
   showAsgTab('work');
 }
 function showAsgTab(name){
@@ -4525,7 +4587,7 @@ function showAsgTab(name){
   document.getElementById('asgTabAdmin').style.display = name==='admin' ? 'block' : 'none';
   document.getElementById('asgTabBtnWork').classList.toggle('active', name==='work');
   document.getElementById('asgTabBtnAdmin').classList.toggle('active', name==='admin');
-  if(name==='admin' && assignmentSheetId) asgLoadPeopleList();
+  if(name==='admin' && authSheetId) asgLoadPeopleList();
   window.scrollTo({top:0, behavior:'smooth'});
 }
 function copyAsgScriptCode(){
@@ -4536,16 +4598,18 @@ function copyAsgScriptCode(){
 }
 function asgSaveConfig(){
   assignmentSheetId = document.getElementById('asgSheetIdInput').value.trim();
+  authSheetId = document.getElementById('asgAuthSheetIdInput').value.trim();
   assignmentScriptUrl = document.getElementById('asgScriptUrlInput').value.trim();
-  document.getElementById('asgConfigStatus').textContent = (assignmentSheetId && assignmentScriptUrl)
-    ? '✓ Saved for this tab session.' : 'Enter both the Sheet ID and Script URL.';
-  if(assignmentSheetId){ asgLoadPeopleListForLogin(); asgLoadPeopleList(); }
+  document.getElementById('asgConfigStatus').textContent = (assignmentSheetId && authSheetId && assignmentScriptUrl)
+    ? '✓ Saved for this tab session — Assignment data and Auth are two separate Sheets, as configured.'
+    : 'Enter all three: Assignment Sheet ID, Auth Sheet ID, and Script URL.';
+  if(authSheetId){ asgLoadPeopleListForLogin(); asgLoadPeopleList(); }
 }
 
 /* ---------- Login ---------- */
 function asgLoadPeopleListForLogin(){
-  if(!assignmentSheetId || !assignmentScriptUrl){ return; }
-  jsonpRequest(assignmentScriptUrl, { action:'listAuthPeople', sheetId:assignmentSheetId }).then(data=>{
+  if(!authSheetId || !assignmentScriptUrl){ return; }
+  jsonpRequest(assignmentScriptUrl, { action:'listAuthPeople', authSheetId }).then(data=>{
     const sel = document.getElementById('asgLoginPerson');
     const people = ((data && data.people) || []).filter(p=>p.status==='Active');
     sel.innerHTML = '<option value="">— select —</option>' + people.map(p=>`<option value="${p.personLabel}">${p.personLabel}${p.role?' ('+p.role+')':''}</option>`).join('');
@@ -4558,7 +4622,7 @@ function asgLogin(){
   if(!assignmentSheetId || !assignmentScriptUrl){ statusEl.textContent = '⚠ Set up the Assignment Sheet/Script in "Manage Access" first.'; return; }
   if(!personLabel || !code){ statusEl.textContent = 'Select your name and enter your 6-digit code.'; return; }
   statusEl.textContent = 'Checking…';
-  jsonpRequest(assignmentScriptUrl, { action:'verifyTotp', sheetId:assignmentSheetId, personLabel, code }).then(data=>{
+  jsonpRequest(assignmentScriptUrl, { action:'verifyTotp', authSheetId, personLabel, code }).then(data=>{
     if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Login failed.'); return; }
     asgSessionToken = data.token;
     asgSession = { personLabel, role: data.role, allowedSections: data.allowedSections };
@@ -4607,6 +4671,9 @@ function asgSetGranularity(hours){
 document.getElementById('asgSlotModelChoice').addEventListener('click', e=>{
   const btn = e.target.closest('button'); if(!btn) return;
   asgSlotModel = Number(btn.getAttribute('data-val'));
+  [...document.querySelectorAll('#asgSlotModelChoice button')].forEach(b=>b.classList.remove('on-ok','on-bad','on-neutral'));
+  btn.classList.add('on-neutral');
+  document.getElementById('asgSlotModelChoice').setAttribute('data-current', asgSlotModel);
   document.getElementById('asgGranularityWrap').style.display = asgSlotModel===2 ? 'block' : 'none';
 });
 function asgLoadSlotModel(){
@@ -4614,7 +4681,8 @@ function asgLoadSlotModel(){
     asgSlotModel = (data && data.model) || 1;
     asgGranularity = (data && data.granularityHours) || 2;
     const btn = document.querySelector(`#asgSlotModelChoice button[data-val="${asgSlotModel}"]`);
-    document.querySelectorAll('#asgSlotModelChoice button').forEach(b=>applyToggleColor(b, b===btn ? 'ok' : null));
+    document.querySelectorAll('#asgSlotModelChoice button').forEach(b=>b.classList.remove('on-ok','on-bad','on-neutral'));
+    if(btn) btn.classList.add('on-neutral');
     document.getElementById('asgSlotModelChoice').setAttribute('data-current', asgSlotModel);
     document.getElementById('asgGranularityWrap').style.display = asgSlotModel===2 ? 'block' : 'none';
     asgSetGranularity(asgGranularity);
@@ -4653,7 +4721,7 @@ function computeSlotsForDate(dateStr, model, granHours){
     ];
   }
   const wh = sliceIntoBlocks('08:00', isFriday?'17:30':'17:00', granHours, 'WH');
-  const ot = sliceIntoBlocks(isFriday?'18:00':'17:30', isFriday?'20:00':'19:30', granHours, 'OT');
+  const ot = [`Overtime (${isFriday?'18:00-20:00':'17:30-19:30'})`];
   return wh.concat(ot);
 }
 
@@ -4661,7 +4729,8 @@ function computeSlotsForDate(dateStr, model, granHours){
 function asgLoadRoster(){
   jsonpRequest(assignmentScriptUrl, { action:'getRoster', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection }).then(data=>{
     asgRoster = (data && data.roster) || [];
-    asgRenderTable();
+    asgRenderTeamChips();
+    asgLoadTeams();
   }).catch(()=>{});
 }
 function asgAddRosterName(){
@@ -4679,7 +4748,36 @@ function asgAddRosterName(){
   }).catch(()=>{ statusEl.textContent = '⚠ Could not add — check your connection.'; });
 }
 
-/* ---------- Today's Assignment table ---------- */
+/* ---------- Teams ---------- */
+function asgRenderTeamChips(){
+  document.getElementById('asgTeamMemberChips').innerHTML = asgRoster.map(emp=>
+    `<button type="button" onclick="this.classList.toggle('selected')">${emp}</button>`).join('');
+}
+function asgLoadTeams(){
+  jsonpRequest(assignmentScriptUrl, { action:'getTeams', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection }).then(data=>{
+    asgTeams = (data && data.teams) || [];
+    asgRenderTable();
+  }).catch(()=>{});
+}
+function asgCreateTeam(){
+  const name = document.getElementById('asgNewTeamName').value.trim();
+  const members = [...document.querySelectorAll('#asgTeamMemberChips button.selected')].map(b=>b.textContent);
+  const statusEl = document.getElementById('asgTeamStatus');
+  if(!name){ statusEl.textContent = 'Enter a team name.'; return; }
+  if(members.length<2){ statusEl.textContent = 'Select at least two people for a team.'; return; }
+  statusEl.textContent = 'Saving…';
+  fetch(assignmentScriptUrl, {
+    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body: JSON.stringify({ action:'createTeam', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, teamName:name, members })
+  }).then(()=>{
+    statusEl.textContent = `✓ Saved "${name}" (unconfirmed — refreshing).`;
+    document.getElementById('asgNewTeamName').value = '';
+    document.querySelectorAll('#asgTeamMemberChips button').forEach(b=>b.classList.remove('selected'));
+    setTimeout(asgLoadTeams, 800);
+  }).catch(()=>{ statusEl.textContent = '⚠ Could not save — check your connection.'; });
+}
+
+/* ---------- Today's Assignment grid ---------- */
 function asgLoadDate(){
   if(!asgActiveSection) return;
   const date = document.getElementById('asgDate').value;
@@ -4692,67 +4790,75 @@ function asgLoadDate(){
 function asgFindAssignment(slot, employee){
   return asgAssignments.find(r=>r.slot===slot && r.employee===employee);
 }
+function asgFindTeamAssignment(slot, teamName){
+  return asgAssignments.find(r=>r.slot===slot && r.groupTag===teamName);
+}
 function asgRenderTable(){
   const wrap = document.getElementById('asgTableWrap');
   if(!asgActiveSection || !document.getElementById('asgDate').value){ wrap.innerHTML=''; return; }
   const slots = computeSlotsForDate(document.getElementById('asgDate').value, asgSlotModel, asgGranularity);
   if(asgRoster.length===0){
-    wrap.innerHTML = '<div class="banner" style="background:#fde3e0; border-color:#f0aca0; color:#7a1d10;">⚠ No one on the roster yet — type a name in the "Roster" box above and tap Add. Assign/Reassign controls appear here, one card per person per slot, right after.</div>';
+    wrap.innerHTML = '<div class="banner" style="background:#fde3e0; border-color:#f0aca0; color:#7a1d10;">⚠ No one on the roster yet — type a name in the "Roster" box above and tap Add. This grid fills in with one row per person (and per team) right after.</div>';
     return;
   }
-  let html = '';
-  slots.forEach(slot=>{
-    asgRoster.forEach(emp=>{
-      const a = asgFindAssignment(slot, emp);
-      const groupNote = a && a.groupTag ? ' <span style="color:var(--muted); font-size:11.5px;">(grouped with others)</span>' : '';
-      const fieldId = 'asgProg-' + btoa(unescape(encodeURIComponent(slot+'|'+emp))).replace(/[^a-zA-Z0-9]/g,'');
-      html += `<div class="pc-cloud" style="margin:0;">
-        <div class="pc-meta" style="margin-bottom:4px;">${slot}</div>
-        <div class="pc-name" style="font-size:16px;">${emp}</div>
-        <div style="margin:6px 0 10px; font-size:14px;">${a && a.task ? '📌 '+a.task+groupNote : '<span style="color:var(--muted);">— not assigned yet —</span>'}</div>
-        <button class="btn amber small" onclick="asgOpenAssignModal('${slot.replace(/'/g,"\\'")}','${emp.replace(/'/g,"\\'")}')">✏ Assign / Reassign</button>
-        <label class="field-label" style="margin-top:10px;">Work Done</label>
-        <div class="row">
-          <input type="text" value="${a && a.workDone ? a.workDone.replace(/"/g,'&quot;') : ''}" id="${fieldId}" placeholder="What did they do…">
-          <button class="btn outline small" style="flex:0 0 70px;" onclick="asgSaveProgressForRow('${slot.replace(/'/g,"\\'")}','${emp.replace(/'/g,"\\'")}')">💾 Save</button>
-        </div>
-      </div>`;
-    });
-  });
-  wrap.innerHTML = html;
+  const rows = [
+    ...asgTeams.map(t=>({ key:'team:'+t.teamName, label:'👥 '+t.teamName, isTeam:true, team:t })),
+    ...asgRoster.map(emp=>({ key:'emp:'+emp, label:emp, isTeam:false, emp })),
+  ];
+  const thead = `<tr><th style="position:sticky; left:0; background:var(--paper); z-index:1;">Who</th>${slots.map(s=>`<th>${s}</th>`).join('')}</tr>`;
+  const tbody = rows.map(r=>{
+    const cells = slots.map(slot=>{
+      const a = r.isTeam ? asgFindTeamAssignment(slot, r.team.teamName) : asgFindAssignment(slot, r.emp);
+      const taskText = a && a.task ? a.task : '<span style="color:var(--muted);">— tap to assign —</span>';
+      const doneTag = a && a.workDone ? ' <span style="color:var(--ok); font-size:10.5px; font-weight:700;">✓ done</span>' : '';
+      return `<td style="cursor:pointer; min-width:130px;" onclick="asgOpenAssignModal('${slot.replace(/'/g,"\\'")}','${r.key.replace(/'/g,"\\'")}')">${taskText}${doneTag}</td>`;
+    }).join('');
+    return `<tr><td style="position:sticky; left:0; background:#fff; font-weight:700; white-space:nowrap;">${r.label}</td>${cells}</tr>`;
+  }).join('');
+  wrap.innerHTML = `<table class="records">${thead}${tbody}</table>`;
 }
-function asgOpenAssignModal(slot, employee){
-  asgAssignCtx = { slot };
-  const existing = asgFindAssignment(slot, employee);
+function asgOpenAssignModal(slot, rowKey){
+  asgAssignCtx = { slot, rowKey };
+  const isTeam = rowKey.indexOf('team:')===0;
+  const key = rowKey.slice(rowKey.indexOf(':')+1);
+  let existing, preselect;
+  if(isTeam){
+    const team = asgTeams.find(t=>t.teamName===key);
+    preselect = team ? team.members : [];
+    existing = asgFindTeamAssignment(slot, key);
+  } else {
+    preselect = [key];
+    existing = asgFindAssignment(slot, key);
+  }
   document.getElementById('asgAssignModalTitle').textContent = `Assign — ${slot}`;
   document.getElementById('asgAssignTaskText').value = existing ? existing.task || '' : '';
+  document.getElementById('asgAssignWorkDoneText').value = existing ? existing.workDone || '' : '';
   document.getElementById('asgAssignEmployeeChips').innerHTML = asgRoster.map(emp=>
-    `<button type="button" class="${emp===employee?'selected':''}" onclick="this.classList.toggle('selected')">${emp}</button>`).join('');
+    `<button type="button" class="${preselect.includes(emp)?'selected':''}" onclick="this.classList.toggle('selected')">${emp}</button>`).join('');
   document.getElementById('asgAssignModal').classList.add('open');
 }
 function closeAsgAssignModal(){ document.getElementById('asgAssignModal').classList.remove('open'); asgAssignCtx = null; }
 function asgSubmitAssign(){
   const task = document.getElementById('asgAssignTaskText').value.trim();
+  const workDone = document.getElementById('asgAssignWorkDoneText').value.trim();
   const employees = [...document.querySelectorAll('#asgAssignEmployeeChips button.selected')].map(b=>b.textContent);
   if(!task){ alert('Enter what they are assigned to do.'); return; }
   if(employees.length===0){ alert('Select at least one employee.'); return; }
   const date = document.getElementById('asgDate').value;
+  const isTeam = asgAssignCtx.rowKey.indexOf('team:')===0;
+  const groupTag = isTeam ? asgAssignCtx.rowKey.slice(5) : undefined;
   fetch(assignmentScriptUrl, {
     method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'assignTask', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot:asgAssignCtx.slot, employees, task })
+    body: JSON.stringify({ action:'assignTask', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot:asgAssignCtx.slot, employees, task, groupTag })
   }).then(()=>{
-    closeAsgAssignModal();
-    setTimeout(asgLoadDate, 800);
+    if(!workDone){ closeAsgAssignModal(); setTimeout(asgLoadDate, 800); return; }
+    Promise.all(employees.map(emp=>
+      fetch(assignmentScriptUrl, {
+        method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+        body: JSON.stringify({ action:'saveProgress', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot:asgAssignCtx.slot, employee:emp, workDone })
+      })
+    )).then(()=>{ closeAsgAssignModal(); setTimeout(asgLoadDate, 800); });
   }).catch(()=>{ alert('Could not send — check your connection.'); });
-}
-function asgSaveProgressForRow(slot, employee){
-  const fieldId = 'asgProg-' + btoa(unescape(encodeURIComponent(slot+'|'+employee))).replace(/[^a-zA-Z0-9]/g,'');
-  const workDone = document.getElementById(fieldId).value.trim();
-  const date = document.getElementById('asgDate').value;
-  fetch(assignmentScriptUrl, {
-    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'saveProgress', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot, employee, workDone })
-  }).then(()=>{ setTimeout(asgLoadDate, 800); }).catch(()=>{});
 }
 
 /* ---------- Print ---------- */
@@ -4802,7 +4908,7 @@ function asgEnrollPerson(){
   if(!personLabel){ statusEl.textContent = 'Enter a person label.'; return; }
   if(sections.length===0){ statusEl.textContent = 'Select at least one allowed section.'; return; }
   statusEl.textContent = 'Enrolling…';
-  jsonpRequest(assignmentScriptUrl, { action:'enrollPerson', sheetId:assignmentSheetId, personLabel, role, allowedSections:sections.join(',') }).then(data=>{
+  jsonpRequest(assignmentScriptUrl, { action:'enrollPerson', authSheetId, personLabel, role, allowedSections:sections.join(',') }).then(data=>{
     if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Could not enroll.'); return; }
     statusEl.textContent = '✓ Enrolled.';
     document.getElementById('asgEnrollLabel').value=''; document.getElementById('asgEnrollRole').value='';
@@ -4828,7 +4934,7 @@ function asgEnrollPerson(){
 function closeAsgEnrollResult(){ document.getElementById('asgEnrollResultModal').classList.remove('open'); }
 function asgLoadPeopleList(){
   if(!assignmentSheetId || !assignmentScriptUrl) return;
-  jsonpRequest(assignmentScriptUrl, { action:'listAuthPeople', sheetId:assignmentSheetId }).then(data=>{
+  jsonpRequest(assignmentScriptUrl, { action:'listAuthPeople', authSheetId }).then(data=>{
     const people = (data && data.people) || [];
     const wrap = document.getElementById('asgPeopleList');
     if(people.length===0){ wrap.innerHTML = '<div class="subtext">No one enrolled yet.</div>'; return; }
@@ -4846,7 +4952,7 @@ function asgLoadPeopleList(){
 }
 function asgRevokePerson(personLabel){
   if(!confirm(`Revoke access for "${personLabel}"? They won't be able to log in again until re-enrolled.`)) return;
-  jsonpRequest(assignmentScriptUrl, { action:'revokePerson', sheetId:assignmentSheetId, personLabel }).then(()=>{
+  jsonpRequest(assignmentScriptUrl, { action:'revokePerson', authSheetId, personLabel }).then(()=>{
     asgLoadPeopleList(); asgLoadPeopleListForLogin();
   }).catch(()=>{ alert('Could not revoke — check your connection.'); });
 }
