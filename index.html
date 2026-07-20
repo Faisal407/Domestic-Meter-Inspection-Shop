@@ -777,6 +777,9 @@ function output(result, callback) {
       (<code>listprep_meterNo_device_...</code>). Nothing about Receiving Inspection changes. Note:
       unlike Receiving, there's no "Sync from Sheet" read-back for these yet — each device only sees
       what it has saved locally so far.
+      Each List Prep project also gets its own <code>List For Print-[Project Name]</code> tab —
+      a 4-column-block printable grid (Sr. No. / Meter Type / Meter No., 50 rows per block, 200 per
+      page), Meter Type shown as <code>Alias-Category</code>, matching the official register format.
       <b>To grant Drive access:</b> in the function dropdown next to ▶ Run, select
       <code>authorizeDriveAccess</code> — not <code>doPost</code>, since doPost exits before touching Drive when
       run manually and will never trigger the permission prompt — then click Run and approve the popup.
@@ -813,15 +816,20 @@ function doPost(e) {
     if (!lpSheet) {
       lpSheet = ss.insertSheet('Dispatch-Scrap List');
       lpSheet.appendRow(['Timestamp','Sr No','Meter No','Meter Type','Year of Manufacturing',
-        'Declared Status','Lot No','Reference Match','Remarks','List','Device','Photo URLs']);
-      lpSheet.getRange(1,1,1,12).setFontWeight('bold').setBackground('#eef1f3');
+        'Declared Status','Lot No','Reference Match','Remarks','List','Device','Photo URLs','Meter Body Number']);
+      lpSheet.getRange(1,1,1,13).setFontWeight('bold').setBackground('#eef1f3');
     }
     var lpPhotoUrls = uploadPhotos(data.photo, 'listprep');
     lpSheet.appendRow([
       new Date(), data.sr, data.meterNo, data.meterType, data.yearMfg || '',
       data.status || '', data.lotNo || '', data.refMatch || '', data.remarks || '',
-      data.project, data.device, lpPhotoUrls
+      data.project, data.device, lpPhotoUrls, data.bodyNo || ''
     ]);
+    try {
+      appendToListPrepPrintSheet(ss, data);
+    } catch (printErr) {
+      Logger.log('List For Print write failed: ' + printErr.message);
+    }
     return ContentService.createTextOutput(JSON.stringify({status:'ok'}))
       .setMimeType(ContentService.MimeType.JSON);
   }
@@ -959,6 +967,57 @@ function appendToPrintSheet(ss, data) {
   sheet.getRange(idRow, 1, 1, 2).merge().setValue('Employee #/SN #/CNIC #: ____________________');
   sheet.getRange(idRow, 3, 1, 3).merge().setValue('Employee #/SN #/CNIC #: ____________________');
   sheet.getRange(idRow, 6, 1, 2).merge().setValue('Name: ____________________');
+}
+
+// List Prep "List For Print-[Project Name]" — 4 side-by-side blocks of 50 rows each (Sr. No. /
+// Meter Type / Meter No.), matching the exact reference template: Times New Roman size 10, bold
+// headers, thin borders on every cell, centered. Sr. No. continues across blocks (1-50, 51-100,
+// 101-150, 151-200) so one page holds 200 meters; a project exceeding 200 starts a new page below,
+// repeating its own title + header rows.
+function appendToListPrepPrintSheet(ss, data) {
+  var sheetName = 'List For Print-' + data.project;
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) sheet = ss.insertSheet(sheetName);
+
+  var ROWS_PER_BLOCK = 50;
+  var BLOCKS_PER_PAGE = 4;
+  var COLS_PER_BLOCK = 3;
+  var TOTAL_COLS = BLOCKS_PER_PAGE * COLS_PER_BLOCK; // 12
+  var ENTRIES_PER_PAGE = ROWS_PER_BLOCK * BLOCKS_PER_PAGE; // 200
+  var PAGE_TOTAL_ROWS = 2 + ROWS_PER_BLOCK + 1; // title + header + 50 data rows + 1 spacer
+
+  var sr = Number(data.sr) || 1;
+  var pageIndex = Math.floor((sr - 1) / ENTRIES_PER_PAGE);
+  var posInPage = (sr - 1) % ENTRIES_PER_PAGE;
+  var blockIndex = Math.floor(posInPage / ROWS_PER_BLOCK);   // 0-3
+  var rowInBlock = posInPage % ROWS_PER_BLOCK;                // 0-49
+
+  var pageStartRow = pageIndex * PAGE_TOTAL_ROWS + 1;
+  var titleRow = pageStartRow;
+  var headerRow = pageStartRow + 1;
+  var targetRow = pageStartRow + 2 + rowInBlock;
+  var startCol = blockIndex * COLS_PER_BLOCK + 1; // 1, 4, 7, or 10
+
+  // Draw this page's title + column headers once, the first time anything lands on it.
+  if (!sheet.getRange(titleRow, 1).getValue()) {
+    sheet.getRange(titleRow, 1, 1, TOTAL_COLS).merge().setValue(data.project)
+      .setFontWeight('bold').setFontSize(14).setFontFamily('Times New Roman').setHorizontalAlignment('center');
+    sheet.setRowHeight(titleRow, 30);
+    for (var b = 0; b < BLOCKS_PER_PAGE; b++) {
+      var c = b * COLS_PER_BLOCK + 1;
+      sheet.getRange(headerRow, c, 1, 3).setValues([['Sr. No.', 'Meter Type', 'Meter No.']])
+        .setFontWeight('bold').setFontFamily('Times New Roman').setFontSize(10)
+        .setHorizontalAlignment('center')
+        .setBorder(true, true, true, true, true, true, 'black', SpreadsheetApp.BorderStyle.THIN);
+    }
+    sheet.setRowHeight(headerRow, 40);
+    for (var cc = 1; cc <= TOTAL_COLS; cc++) sheet.setColumnWidth(cc, 70);
+  }
+
+  var meterType = (data.alias || '-') + '-' + (data.category || '-');
+  sheet.getRange(targetRow, startCol, 1, 3).setValues([[sr, meterType, data.meterNo]])
+    .setFontFamily('Times New Roman').setFontSize(10).setHorizontalAlignment('center')
+    .setBorder(true, true, true, true, true, true, 'black', SpreadsheetApp.BorderStyle.THIN);
 }
 
 function doGet(e) {
@@ -1216,6 +1275,9 @@ function doGet(e) {
       <label class="field-label">Meter No.</label>
       <input type="text" id="lpMeterNo" placeholder="e.g. A7885606" oninput="onLpMeterNoInput()">
       <div id="lpMatchBadge"></div>
+      <label class="field-label">Meter Body Number</label>
+      <input type="text" id="lpBodyNo" placeholder="e.g. 4471829" inputmode="numeric">
+      <div class="subtext" style="margin-top:4px;">Kept in the working Sheet only — not shown on the printable register.</div>
     </div>
 
     <div class="card">
@@ -4452,6 +4514,7 @@ PHOTO_MODE_MAP.lpphoto = { list: () => lpPhotos, containerId: 'lpPhotoThumb' };
 /* ---------- Save / sync entry ---------- */
 function resetListPrepForm(clearMeterNo){
   if(clearMeterNo) document.getElementById('lpMeterNo').value = '';
+  document.getElementById('lpBodyNo').value = '';
   document.getElementById('lpMatchBadge').innerHTML = '';
   lpSelectedCategory=''; lpSelectedAlias=''; lpSelectedVariant='';
   document.getElementById('lpAliasWrap').style.display='none';
@@ -4482,7 +4545,7 @@ function saveListPrepEntry(){
   const refMatch = p.referenceMap.size===0 ? 'N/A' : (refEntry ? 'Listed' : 'Not on List');
 
   const rec = {
-    sr: p.srCounter++, meterNo, category:cat, alias, variant, meterType,
+    sr: p.srCounter++, meterNo, bodyNo: document.getElementById('lpBodyNo').value.trim(), category:cat, alias, variant, meterType,
     yearMfg: document.getElementById('lpYearMfg').value.trim(),
     status: getToggleVal('lpStatus') || 'dispatch',
     lotNo: document.getElementById('lpLotNo').value.trim(),
@@ -4505,7 +4568,8 @@ function saveListPrepEntry(){
 function syncListPrepEntry(p, rec, photoB64){
   if(!p.appsScriptUrl || !p.sheetId){ rec.cloudStatus = 'Not configured'; renderLpRecordsTable(); return; }
   const payload = {
-    action:'saveListEntry', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, meterType:rec.meterType,
+    action:'saveListEntry', sheetId:p.sheetId, sr:rec.sr, meterNo:rec.meterNo, bodyNo:rec.bodyNo, meterType:rec.meterType,
+    alias:rec.alias, category:rec.category,
     yearMfg:rec.yearMfg, status:rec.status, lotNo:rec.lotNo, refMatch:rec.refMatch, remarks:rec.remarks,
     project:p.name, device:p.device, photo: photoB64 && photoB64.length ? photoB64 : undefined,
   };
@@ -4546,7 +4610,7 @@ function exportListPrepExcel(id){
   const p = id ? listPrepProjects.find(x=>x.id===id) : getActiveListPrepProject();
   if(!p || p.records.length===0){ alert('No entries to export yet for this list.'); return; }
   const toRows = list => list.map(r=>({
-    'Sr. No.': r.sr, 'Meter No.': r.meterNo, 'Meter Type': r.meterType, 'Year of Manufacturing': r.yearMfg,
+    'Sr. No.': r.sr, 'Meter No.': r.meterNo, 'Meter Body Number': r.bodyNo, 'Meter Type': r.meterType, 'Year of Manufacturing': r.yearMfg,
     'Declared Status': r.status, 'Lot No.': r.lotNo, 'Reference Match': r.refMatch,
     'Photo URLs': (r.photoUrls||[]).join('\n'), 'Remarks': r.remarks, 'List': p.name, 'Device': p.device,
   }));
