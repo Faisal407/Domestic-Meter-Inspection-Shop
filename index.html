@@ -1510,8 +1510,13 @@ function doGet(e) {
       two separate Drive folders.<br>
       <b>2.</b> Go to <code>script.google.com</code> → New project → paste the code below exactly as-is —
       one script serves both Sheets, since the ID is sent with each request.<br>
-      <b>3.</b> Deploy → New deployment → Web app → Execute as: Me → Access: Anyone → Deploy.<br>
-      <b>4.</b> Paste both Sheet IDs and the Script URL above, tap Save.
+      <b>3.</b> <b>Before deploying:</b> in the function dropdown next to ▶ Run, select
+      <code>authorizeAssignmentAccess</code> — not <code>doPost</code>, since doPost exits before touching
+      Sheets when run manually and will never trigger the permission prompt — then click Run and approve the
+      popup (choose your account → Advanced → Go to [project] (unsafe) → Allow). This is the step that's
+      easy to miss and causes "could not reach the server" errors on enrollment/login if skipped.<br>
+      <b>4.</b> Deploy → New deployment → Web app → Execute as: Me → Access: Anyone → Deploy.<br>
+      <b>5.</b> Paste both Sheet IDs and the Script URL above, tap Save.
     </p>
     <textarea readonly rows="60" class="mono" style="font-size:11px; white-space:pre;" id="asgScriptCodeBox">// ===== DMIS Assignment / Duties Script =====
 // Real TOTP (Google Authenticator) verification happens entirely here, server-side.
@@ -1520,6 +1525,14 @@ function doGet(e) {
 // it at a different Sheet anytime without redeploying.
 
 var SESSION_HOURS = 14; // how long a verified session stays valid without re-entering a code
+
+function authorizeAssignmentAccess() {
+  // Run THIS specific function once manually (select it in the dropdown next to ▶ Run) to trigger
+  // the Sheets permission prompt. doPost/doGet can't trigger it, since they exit immediately before
+  // touching Sheets when run manually with no real request data — same lesson as the Entries Script.
+  var testSheet = SpreadsheetApp.create('DMIS Assignment Script — authorization test (safe to delete)');
+  Logger.log('Assignment Script access OK. Created a test sheet — safe to delete: ' + testSheet.getUrl());
+}
 
 function doPost(e) {
   if (!e || !e.postData) return output({status:'error', message:'No request data.'});
