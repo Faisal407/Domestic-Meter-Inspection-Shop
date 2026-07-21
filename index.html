@@ -229,6 +229,11 @@ window.QRCode = {
       <div class="activity-title">Assignment / Duties</div>
       <div class="activity-sub">Daily work assignment, progress, and audit trail</div>
     </button>
+    <button class="activity-card" onclick="openActivity('gate')">
+      <div class="activity-icon">🚪</div>
+      <div class="activity-title">Gate Entry Register</div>
+      <div class="activity-sub">Staff, visitors, and material/asset in-out — one gate log</div>
+    </button>
   </div>
 </div>
 
@@ -1502,6 +1507,8 @@ function doGet(e) {
         <input type="text" id="asgNewRosterName" placeholder="Add a name to this section's roster">
         <button class="btn outline small" style="flex:0 0 70px;" onclick="asgAddRosterName()">Add</button>
       </div>
+      <label class="field-label" style="margin-top:8px;">Sub-Section</label>
+      <div class="chip-grid" id="asgSubSectionChips"></div>
       <div class="ocr-status" id="asgRosterStatus"></div>
     </div>
 
@@ -1590,10 +1597,13 @@ var SESSION_HOURS = 14; // how long a verified session stays valid without re-en
 
 function authorizeAssignmentAccess() {
   // Run THIS specific function once manually (select it in the dropdown next to ▶ Run) to trigger
-  // the Sheets permission prompt. doPost/doGet can't trigger it, since they exit immediately before
-  // touching Sheets when run manually with no real request data — same lesson as the Entries Script.
+  // the Sheets AND Drive permission prompt (Drive is needed now for Gate Entry photo/video uploads).
+  // doPost/doGet can't trigger it, since they exit immediately before touching anything when run
+  // manually with no real request data — same lesson as the Entries Script.
   var testSheet = SpreadsheetApp.create('DMIS Assignment Script — authorization test (safe to delete)');
+  var testFolder = DriveApp.getFoldersByName('Gate Entry Photos');
   Logger.log('Assignment Script access OK. Created a test sheet — safe to delete: ' + testSheet.getUrl());
+  Logger.log('Drive access OK — "Gate Entry Photos" folder exists: ' + testFolder.hasNext());
 }
 
 function doPost(e) {
@@ -1609,6 +1619,11 @@ function doPost(e) {
   if (a === 'saveProgress')      return output(saveProgress(data));
   if (a === 'saveSlotModel')     return output(saveSlotModel(data));
   if (a === 'createTeam')        return output(createTeam(data));
+  if (a === 'gateStaffMove')     return output(gateStaffMove(data));
+  if (a === 'gateAddVisitor')    return output(gateAddVisitor(data));
+  if (a === 'gateVisitorMove')   return output(gateVisitorMove(data));
+  if (a === 'gateAddMaterial')   return output(gateAddMaterial(data));
+  if (a === 'gateMaterialOut')   return output(gateMaterialOut(data));
   return output({status:'error', message:'Unknown action'});
 }
 
@@ -1626,6 +1641,10 @@ function doGet(e) {
   else if (a === 'getSlotModel')   result = withSession(p, function(sess){ return getSlotModel(p.sheetId, sess.section); });
   else if (a === 'getLog')         result = withSession(p, function(sess){ return { rows: getLog(p.sheetId, sess.section, p.date) }; });
   else if (a === 'getTeams')       result = withSession(p, function(sess){ return { teams: getTeams(p.sheetId, sess.section) }; });
+  else if (a === 'getRosterBoth')  result = withSession(p, function(sess){ return { inspectionFlow: getRoster(p.sheetId, 'Inspection & Flow Proving'), mrMrvMir: getRoster(p.sheetId, 'MR/MRV & MIR') }; });
+  else if (a === 'gateGetStaffToday')    result = withSession(p, function(sess){ return { rows: gateGetStaffToday(p.sheetId, p.date) }; });
+  else if (a === 'gateGetVisitorsToday') result = withSession(p, function(sess){ return { rows: gateGetVisitorsToday(p.sheetId, p.date) }; });
+  else if (a === 'gateGetMaterialToday') result = withSession(p, function(sess){ return { rows: gateGetMaterialToday(p.sheetId, p.date) }; });
   else result = { status: 'error', message: 'Unknown action' };
   return output(result, callback);
 }
@@ -1799,24 +1818,26 @@ function getRosterSheet(sheetId, section) {
   var sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
-    sheet.appendRow(['Employee Name']);
-    sheet.getRange(1,1).setFontWeight('bold');
+    sheet.appendRow(['Employee Name', 'Sub-Section']);
+    sheet.getRange(1,1,1,2).setFontWeight('bold');
   }
   return sheet;
 }
 function getRoster(sheetId, section) {
   var sheet = getRosterSheet(sheetId, section);
   var vals = sheet.getDataRange().getValues();
-  var names = [];
-  for (var i = 1; i < vals.length; i++) if (vals[i][0]) names.push(String(vals[i][0]));
-  return names;
+  var roster = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (vals[i][0]) roster.push({ name: String(vals[i][0]), subSection: String(vals[i][1] || '') });
+  }
+  return roster;
 }
 function addRosterName(data) {
   return withSession(data, function(sess){
     var sheet = getRosterSheet(data.sheetId, data.section);
-    var existing = getRoster(data.sheetId, data.section).map(function(n){ return n.toLowerCase(); });
+    var existing = getRoster(data.sheetId, data.section).map(function(r){ return r.name.toLowerCase(); });
     if (existing.indexOf(String(data.name).trim().toLowerCase()) === -1) {
-      sheet.appendRow([data.name.trim()]);
+      sheet.appendRow([data.name.trim(), data.subSection || '']);
     }
     return { status: 'ok' };
   });
@@ -1828,17 +1849,17 @@ function addRosterName(data) {
    ============================================================ */
 function getSlotModel(sheetId, section) {
   var sheet = getRosterSheet(sheetId, section);
-  var model = sheet.getRange('C1').getValue() || 1;
-  var granularity = sheet.getRange('C2').getValue() || 2;
+  var model = sheet.getRange('E1').getValue() || 1;
+  var granularity = sheet.getRange('E2').getValue() || 2;
   return { model: Number(model), granularityHours: Number(granularity) };
 }
 function saveSlotModel(data) {
   return withSession(data, function(sess){
     var sheet = getRosterSheet(data.sheetId, data.section);
-    sheet.getRange('B1').setValue('Slot Model (1 or 2):');
-    sheet.getRange('C1').setValue(data.model);
-    sheet.getRange('B2').setValue('Granularity Hours (Model 2 only):');
-    sheet.getRange('C2').setValue(data.granularityHours || 2);
+    sheet.getRange('D1').setValue('Slot Model (1 or 2):');
+    sheet.getRange('E1').setValue(data.model);
+    sheet.getRange('D2').setValue('Granularity Hours (Model 2 only):');
+    sheet.getRange('E2').setValue(data.granularityHours || 2);
     return { status: 'ok' };
   });
 }
@@ -1960,10 +1981,16 @@ function assignTask(data) {
       data.employees.forEach(function(emp){
         var vals = sheet.getDataRange().getValues();
         var rowIdx = findAssignRow(vals, data.date, data.slot, emp);
-        var row = [data.date, data.slot, emp, groupTag, data.task, new Date(), sess.personLabel, 0, '', '', ''];
+        var prevTask = rowIdx !== -1 ? String(vals[rowIdx - 1][4] || '') : '';
+        var prevCount = rowIdx !== -1 ? (Number(vals[rowIdx - 1][7]) || 0) : 0;
+        var isChange = prevTask && prevTask !== data.task;
+        var newCount = isChange ? prevCount + 1 : prevCount;
+        var row = [data.date, data.slot, emp, groupTag, data.task, new Date(), sess.personLabel, newCount, '', '', ''];
         if (rowIdx === -1) sheet.appendRow(row);
-        else sheet.getRange(rowIdx, 1, 1, 7).setValues([[data.date, data.slot, emp, groupTag, data.task, new Date(), sess.personLabel]]);
-        appendLog(data.sheetId, data.section, data.date, data.slot, emp, groupTag, 'Assigned', data.task, sess.personLabel, '');
+        else sheet.getRange(rowIdx, 1, 1, 8).setValues([[data.date, data.slot, emp, groupTag, data.task, new Date(), sess.personLabel, newCount]]);
+        var actionName = isChange ? 'Reassigned' : 'Assigned';
+        var logNotes = isChange ? ('Previous task: "' + prevTask + '"') : '';
+        appendLog(data.sheetId, data.section, data.date, data.slot, emp, groupTag, actionName, data.task, sess.personLabel, logNotes);
       });
       return { status: 'ok' };
     } finally { lock.releaseLock(); }
@@ -2002,6 +2029,282 @@ function saveProgress(data) {
   });
 }
 
+/* ============================================================
+   GATE ENTRY REGISTER — shares this same Auth Sheet (Gate Entry is
+   just a third possible value in "Allowed Sections") and shares the
+   roster/sub-section data from Assignment/Duties. Its own data lives
+   in three new tabs in the same Assignment Sheet: Gate-StaffInOut,
+   Gate-Visitors, Gate-Material.
+   ============================================================ */
+function getGateStaffSheet(sheetId) {
+  var ss = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('Gate-StaffInOut');
+  if (!sheet) {
+    sheet = ss.insertSheet('Gate-StaffInOut');
+    sheet.appendRow(['Date','Employee','Sub-Section','Slot1 In','Slot1 Out','Slot1 Reason',
+      'Slot2 In','Slot2 Out','Slot2 Reason','Slot3 In','Slot3 Out','Slot3 Reason',
+      'Available Hours','Remarks']);
+    sheet.getRange(1,1,1,14).setFontWeight('bold').setBackground('#eef1f3');
+  }
+  return sheet;
+}
+function findGateStaffRow(vals, date, employee) {
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][0]) === String(date) && String(vals[i][1]) === String(employee)) return i + 1;
+  }
+  return -1;
+}
+function gateTimeToMinutes(t) {
+  if (!t) return null;
+  var parts = String(t).split(':');
+  if (parts.length < 2) return null;
+  var h = parseInt(parts[0], 10), m = parseInt(parts[1], 10);
+  if (isNaN(h) || isNaN(m)) return null;
+  return h * 60 + m;
+}
+function computeAvailableHours(row) {
+  // row: 0-indexed values matching Gate-StaffInOut column order.
+  var slot1In = row[3], slot1Out = row[4];
+  var ins = [row[3], row[6], row[9]];
+  var outs = [row[4], row[7], row[10]];
+  var reasons = [row[5], row[8], row[11]];
+  var firstIn = gateTimeToMinutes(slot1In);
+  var lastOutVal = null;
+  for (var i = outs.length - 1; i >= 0; i--) { if (outs[i]) { lastOutVal = outs[i]; break; } }
+  var lastOut = gateTimeToMinutes(lastOutVal);
+  if (firstIn === null || lastOut === null) return '';
+  var totalSpan = lastOut - firstIn;
+  if (totalSpan < 0) totalSpan += 24 * 60;
+  var deduction = 0;
+  for (var s = 0; s < 3; s++) {
+    if (reasons[s] === 'Personal' && outs[s] && ins[s + 1]) {
+      var outM = gateTimeToMinutes(outs[s]);
+      var inM = gateTimeToMinutes(ins[s + 1]);
+      if (outM !== null && inM !== null) {
+        var gap = inM - outM;
+        if (gap < 0) gap += 24 * 60;
+        deduction += gap;
+      }
+    }
+  }
+  var net = Math.max(0, totalSpan - deduction);
+  var hrs = Math.floor(net / 60), mins = net % 60;
+  return hrs + 'h ' + (mins < 10 ? '0' + mins : mins) + 'm';
+}
+function gateStaffMove(data) {
+  return withSession(data, function(sess){
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
+    try {
+      var sheet = getGateStaffSheet(data.sheetId);
+      var vals = sheet.getDataRange().getValues();
+      var rowIdx = findGateStaffRow(vals, data.date, data.employee);
+      if (rowIdx === -1) {
+        var newRow = [data.date, data.employee, data.subSection || '', '', '', '', '', '', '', '', '', '', '', ''];
+        sheet.appendRow(newRow);
+        rowIdx = sheet.getLastRow();
+      }
+      var slotBase = 4 + (data.slotIndex - 1) * 3; // 1-indexed "In" column for this slot
+      var targetCol = data.direction === 'in' ? slotBase : slotBase + 1;
+      var timeVal = data.time || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
+      sheet.getRange(rowIdx, targetCol).setValue(timeVal);
+      if (data.direction === 'out' && data.reason) {
+        sheet.getRange(rowIdx, slotBase + 2).setValue(data.reason);
+      }
+      var freshVals = sheet.getDataRange().getValues()[rowIdx - 1];
+      var hoursStr = computeAvailableHours(freshVals);
+      sheet.getRange(rowIdx, 13).setValue(hoursStr);
+      return { status: 'ok', availableHours: hoursStr };
+    } finally { lock.releaseLock(); }
+  });
+}
+function gateGetStaffToday(sheetId, date) {
+  var sheet = getGateStaffSheet(sheetId);
+  var vals = sheet.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][0]) !== String(date)) continue;
+    rows.push({
+      date: vals[i][0], employee: vals[i][1], subSection: vals[i][2],
+      slot1In: vals[i][3], slot1Out: vals[i][4], slot1Reason: vals[i][5],
+      slot2In: vals[i][6], slot2Out: vals[i][7], slot2Reason: vals[i][8],
+      slot3In: vals[i][9], slot3Out: vals[i][10], slot3Reason: vals[i][11],
+      availableHours: vals[i][12], remarks: vals[i][13]
+    });
+  }
+  return rows;
+}
+
+function getGateVisitorSheet(sheetId) {
+  var ss = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('Gate-Visitors');
+  if (!sheet) {
+    sheet = ss.insertSheet('Gate-Visitors');
+    sheet.appendRow(['Date','Sr No','Name','Visitor Type','CNIC / Staff ID','Purpose of Visit',
+      'Slot1 In','Slot1 Out','Slot2 In','Slot2 Out','Slot3 In','Slot3 Out','Photo/Doc URLs','Remarks']);
+    sheet.getRange(1,1,1,14).setFontWeight('bold').setBackground('#eef1f3');
+  }
+  return sheet;
+}
+function gateAddVisitor(data) {
+  return withSession(data, function(sess){
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
+    try {
+      var sheet = getGateVisitorSheet(data.sheetId);
+      var vals = sheet.getDataRange().getValues();
+      var srCount = 0;
+      for (var i = 1; i < vals.length; i++) { if (String(vals[i][0]) === String(data.date)) srCount++; }
+      var sr = srCount + 1;
+      var photoUrls = uploadGateFiles(data.photo, 'visitor_' + data.name);
+      var nowTime = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
+      var row = [data.date, sr, data.name, data.visitorType, data.idNo || '', data.purpose || '',
+        nowTime, '', '', '', '', '', photoUrls, data.remarks || ''];
+      sheet.appendRow(row);
+      return { status: 'ok', sr: sr };
+    } finally { lock.releaseLock(); }
+  });
+}
+function gateVisitorMove(data) {
+  return withSession(data, function(sess){
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
+    try {
+      var sheet = getGateVisitorSheet(data.sheetId);
+      var vals = sheet.getDataRange().getValues();
+      var rowIdx = -1;
+      for (var i = 1; i < vals.length; i++) {
+        if (String(vals[i][0]) === String(data.date) && Number(vals[i][1]) === Number(data.sr)) { rowIdx = i + 1; break; }
+      }
+      if (rowIdx === -1) return { status: 'error', message: 'Visitor not found for that date.' };
+      var slotBase = 7 + (data.slotIndex - 1) * 2; // 1-indexed "In" column for this slot
+      var targetCol = data.direction === 'in' ? slotBase : slotBase + 1;
+      var timeVal = data.time || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
+      sheet.getRange(rowIdx, targetCol).setValue(timeVal);
+      return { status: 'ok' };
+    } finally { lock.releaseLock(); }
+  });
+}
+function gateGetVisitorsToday(sheetId, date) {
+  var sheet = getGateVisitorSheet(sheetId);
+  var vals = sheet.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][0]) !== String(date)) continue;
+    rows.push({
+      date: vals[i][0], sr: vals[i][1], name: vals[i][2], visitorType: vals[i][3], idNo: vals[i][4],
+      purpose: vals[i][5], slot1In: vals[i][6], slot1Out: vals[i][7], slot2In: vals[i][8], slot2Out: vals[i][9],
+      slot3In: vals[i][10], slot3Out: vals[i][11], photoUrls: vals[i][12], remarks: vals[i][13]
+    });
+  }
+  return rows;
+}
+
+function getGateMaterialSheet(sheetId) {
+  var ss = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('Gate-Material');
+  if (!sheet) {
+    sheet = ss.insertSheet('Gate-Material');
+    sheet.appendRow(['Sr No','Date','In Time','Out Time','Type','Material / Asset Name','Quantity',
+      'Gate Pass No','Vehicle No','Driver Name','Department / Person','DMIS Reference Person',
+      'Photo/Doc/Video URLs','Remarks']);
+    sheet.getRange(1,1,1,14).setFontWeight('bold').setBackground('#eef1f3');
+  }
+  return sheet;
+}
+function gateAddMaterial(data) {
+  return withSession(data, function(sess){
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
+    try {
+      var sheet = getGateMaterialSheet(data.sheetId);
+      var vals = sheet.getDataRange().getValues();
+      var srCount = 0;
+      for (var i = 1; i < vals.length; i++) { if (String(vals[i][1]) === String(data.date)) srCount++; }
+      var sr = srCount + 1;
+      var fileUrls = uploadGateFiles(data.photo, 'material_' + (data.materialName || 'item'));
+      if (data.video) {
+        var videoUrl = uploadGateVideo(data.video, 'material_' + (data.materialName || 'item'));
+        fileUrls = fileUrls ? (fileUrls + '\n' + videoUrl) : videoUrl;
+      }
+      var nowTime = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
+      sheet.appendRow([sr, data.date, nowTime, '', data.type, data.materialName || '', data.quantity || '',
+        data.gatePassNo || '', data.vehicleNo || '', data.driverName || '', data.department || '',
+        data.referencePerson || '', fileUrls, data.remarks || '']);
+      return { status: 'ok', sr: sr };
+    } finally { lock.releaseLock(); }
+  });
+}
+function gateMaterialOut(data) {
+  return withSession(data, function(sess){
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try again.' }; }
+    try {
+      var sheet = getGateMaterialSheet(data.sheetId);
+      var vals = sheet.getDataRange().getValues();
+      var rowIdx = -1;
+      for (var i = 1; i < vals.length; i++) {
+        if (String(vals[i][1]) === String(data.date) && Number(vals[i][0]) === Number(data.sr)) { rowIdx = i + 1; break; }
+      }
+      if (rowIdx === -1) return { status: 'error', message: 'Entry not found for that date.' };
+      var timeVal = data.time || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
+      sheet.getRange(rowIdx, 4).setValue(timeVal);
+      return { status: 'ok' };
+    } finally { lock.releaseLock(); }
+  });
+}
+function gateGetMaterialToday(sheetId, date) {
+  var sheet = getGateMaterialSheet(sheetId);
+  var vals = sheet.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][1]) !== String(date)) continue;
+    rows.push({
+      sr: vals[i][0], date: vals[i][1], inTime: vals[i][2], outTime: vals[i][3], type: vals[i][4],
+      materialName: vals[i][5], quantity: vals[i][6], gatePassNo: vals[i][7], vehicleNo: vals[i][8],
+      driverName: vals[i][9], department: vals[i][10], referencePerson: vals[i][11],
+      fileUrls: vals[i][12], remarks: vals[i][13]
+    });
+  }
+  return rows;
+}
+
+function getGatePhotoFolder() {
+  var masterName = 'Gate Entry Photos';
+  var folders = DriveApp.getFoldersByName(masterName);
+  return folders.hasNext() ? folders.next() : DriveApp.createFolder(masterName);
+}
+function uploadGateFiles(base64Array, label) {
+  if (!base64Array || !base64Array.length) return '';
+  var urls = [];
+  try {
+    var folder = getGatePhotoFolder();
+    base64Array.forEach(function(b64, idx) {
+      if (!b64) return;
+      var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg',
+        label + '_' + new Date().getTime() + '_' + idx + '.jpg');
+      var file = folder.createFile(blob);
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      urls.push(file.getUrl());
+    });
+  } catch (err) {
+    return 'Upload error: ' + err.message;
+  }
+  return urls.join('\n');
+}
+function uploadGateVideo(base64Video, label) {
+  try {
+    var folder = getGatePhotoFolder();
+    var blob = Utilities.newBlob(Utilities.base64Decode(base64Video), 'video/webm',
+      label + '_' + new Date().getTime() + '.webm');
+    var file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return file.getUrl();
+  } catch (err) {
+    return 'Video upload error: ' + err.message;
+  }
+}
+
 function output(result, callback) {
   var json = JSON.stringify(result);
   if (callback) return ContentService.createTextOutput(callback + '(' + json + ')').setMimeType(ContentService.MimeType.JAVASCRIPT);
@@ -2024,6 +2327,9 @@ function output(result, callback) {
       <label style="display:flex; align-items:center; gap:6px; font-size:13.5px;">
         <input type="checkbox" id="asgEnrollSec2" style="width:auto;"> MR/MRV &amp; MIR
       </label>
+      <label style="display:flex; align-items:center; gap:6px; font-size:13.5px;">
+        <input type="checkbox" id="asgEnrollSec3" style="width:auto;"> Gate Entry Register
+      </label>
     </div>
     <button class="btn amber" style="margin-top:10px;" onclick="asgEnrollPerson()">Enroll &amp; Generate Code</button>
     <div class="ocr-status" id="asgEnrollStatus"></div>
@@ -2038,6 +2344,180 @@ function output(result, callback) {
 
 </main>
 </div> <!-- /#assignmentShell -->
+
+<!-- ============ GATE ENTRY REGISTER SHELL ============ -->
+<div id="gateShell" style="display:none;">
+<header class="topbar">
+  <div class="row1">
+    <div>
+      <h1>Gate Entry Register</h1>
+      <div class="tag" id="gateTag">Not logged in · SNGPL Faisalabad-D</div>
+    </div>
+    <button class="btn outline small home-btn" onclick="goHome()">🏠 Home</button>
+  </div>
+  <div class="main-tabs">
+    <button class="main-tab active" id="gateTabBtnStaff" onclick="showGateTab('staff')">👤 Staff</button>
+    <button class="main-tab" id="gateTabBtnVisitors" onclick="showGateTab('visitors')">🧑‍🤝‍🧑 Visitors</button>
+    <button class="main-tab" id="gateTabBtnMaterial" onclick="showGateTab('material')">📦 Material/Asset</button>
+  </div>
+</header>
+
+<main>
+
+<div id="gateLoginBlock" class="card">
+  <h2>🔐 Log In</h2>
+  <div class="subtext">Uses the same Google Authenticator enrollment as Assignment/Duties — enrolled and managed from
+    there, under "Manage Access." If your name isn't in the list below, ask the owner to tick "Gate Entry Register"
+    for you when enrolling.</div>
+  <label class="field-label">Person Label</label>
+  <select id="gateLoginPerson"><option value="">— select —</option></select>
+  <label class="field-label">6-digit Code</label>
+  <input type="text" id="gateLoginCode" placeholder="123456" inputmode="numeric" maxlength="6">
+  <button class="btn amber" onclick="gateLogin()">Log In</button>
+  <div class="ocr-status" id="gateLoginStatus"></div>
+</div>
+
+<div id="gateWorkBlock" style="display:none;">
+  <div class="card">
+    <div class="row" style="align-items:center;">
+      <div style="flex:1;">
+        <div class="pc-name" id="gateWhoAmI">—</div>
+      </div>
+      <button class="btn outline small" style="flex:0 0 auto; width:auto;" onclick="gateLogout()">Log Out</button>
+    </div>
+    <label class="field-label" style="margin-top:10px;">Date</label>
+    <input type="date" id="gateDate" onchange="gateLoadAll()">
+  </div>
+
+  <!-- ---- Staff tab ---- -->
+  <div id="gateTabStaff">
+    <div class="card">
+      <h2>Staff In / Out</h2>
+      <div class="subtext">Tap a name to check them in or out. Slot 1 arrival defaults to 08:15 — editable.
+        Up to 3 in/out cycles a day; the last Out recorded is their office departure time.</div>
+      <div id="gateStaffList"></div>
+    </div>
+  </div>
+
+  <!-- ---- Visitors tab ---- -->
+  <div id="gateTabVisitors" style="display:none;">
+    <div class="card">
+      <h2>Visitor Entry</h2>
+      <button class="btn amber" onclick="openGateVisitorModal()">➕ Add Visitor</button>
+      <div id="gateVisitorList" style="margin-top:10px;"></div>
+    </div>
+  </div>
+
+  <!-- ---- Material/Asset tab ---- -->
+  <div id="gateTabMaterial" style="display:none;">
+    <div class="card">
+      <h2>Material / Asset In-Out</h2>
+      <button class="btn amber" onclick="openGateMaterialModal()">➕ Add Entry</button>
+      <div id="gateMaterialList" style="margin-top:10px;"></div>
+    </div>
+  </div>
+</div>
+
+</main>
+</div> <!-- /#gateShell -->
+
+<!-- Gate: staff Out reason picker -->
+<div class="modal-backdrop" id="gateReasonModal">
+  <div class="modal-box">
+    <h3>Reason for Going Out</h3>
+    <div class="subtext" id="gateReasonWho"></div>
+    <div class="doc-select-group" id="gateReasonChoice" data-neutral="true">
+      <button data-val="Personal" data-default="true">Personal</button>
+      <button data-val="Store Faisalabad-D">Store Faisalabad-D</button>
+      <button data-val="Distribution Section">Distribution Section (Meter Receiving Cross-Check)</button>
+    </div>
+    <button class="btn amber" style="margin-top:10px;" onclick="gateSubmitOut()">Confirm Out</button>
+    <button class="btn outline" onclick="closeGateReasonModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Gate: Add Visitor -->
+<div class="modal-backdrop" id="gateVisitorModal">
+  <div class="modal-box">
+    <h3>Add Visitor</h3>
+    <label class="field-label">Name</label>
+    <input type="text" id="gateVisitorName" placeholder="Visitor's name">
+    <label class="field-label">Visitor Type</label>
+    <div class="doc-select-group" id="gateVisitorType" data-neutral="true">
+      <button data-val="Consumer" data-default="true">Consumer</button>
+      <button data-val="Non-DMIS Staff">Non-DMIS Staff</button>
+    </div>
+    <label class="field-label">CNIC / Staff ID</label>
+    <input type="text" id="gateVisitorId" placeholder="Optional">
+    <label class="field-label">Purpose of Visit</label>
+    <input type="text" id="gateVisitorPurpose" placeholder="e.g. Meter reading dispute">
+    <button class="btn outline" onclick="openGateCamera('visitor')">📷 Add Photo</button>
+    <div class="thumb-row" id="gateVisitorPhotoThumb"></div>
+    <button class="btn amber" style="margin-top:10px;" onclick="gateSubmitVisitor()">Save — Logs Them In Now</button>
+    <button class="btn outline" onclick="closeGateVisitorModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Gate: Add Material/Asset -->
+<div class="modal-backdrop" id="gateMaterialModal">
+  <div class="modal-box">
+    <h3>Add Material / Asset Entry</h3>
+    <label class="field-label">Type</label>
+    <div class="doc-select-group" id="gateMaterialType" data-neutral="true">
+      <button data-val="MT" data-default="true" onclick="gateUpdateMaterialFields()">Meters (via Vehicle)</button>
+      <button data-val="AS" onclick="gateUpdateMaterialFields()">Asset / Tool / Equipment</button>
+      <button data-val="OM" onclick="gateUpdateMaterialFields()">Other Material</button>
+    </div>
+    <label class="field-label">Material / Asset Name</label>
+    <input type="text" id="gateMaterialName" placeholder="e.g. G4 Meters — inbound batch">
+    <label class="field-label">Quantity</label>
+    <input type="text" id="gateMaterialQty" placeholder="e.g. 150" inputmode="numeric">
+    <label class="field-label">Gate Pass No.</label>
+    <input type="text" id="gateMaterialGatePass" placeholder="e.g. GP-4471">
+    <div id="gateMaterialVehicleFields">
+      <label class="field-label">Vehicle No.</label>
+      <input type="text" id="gateMaterialVehicle" placeholder="e.g. LEA-1234">
+      <label class="field-label">Driver Name</label>
+      <input type="text" id="gateMaterialDriver" placeholder="Driver's name">
+    </div>
+    <div id="gateMaterialAssetFields" style="display:none;">
+      <label class="field-label">Department / Person</label>
+      <input type="text" id="gateMaterialDept" placeholder="Who it's going to / with">
+      <label class="field-label">DMIS Reference Person</label>
+      <input type="text" id="gateMaterialRefPerson" placeholder="DMIS staff vouching for this">
+    </div>
+    <button class="btn outline" onclick="openGateCamera('material')">📷 Add Photo</button>
+    <div class="thumb-row" id="gateMaterialPhotoThumb"></div>
+    <button class="btn outline" onclick="openGateVideoRecorder()">🎥 Add Video Clip (≤30s)</button>
+    <div class="ocr-status" id="gateMaterialVideoStatus"></div>
+    <label class="field-label">Remarks</label>
+    <textarea id="gateMaterialRemarks" rows="2" placeholder="Optional"></textarea>
+    <button class="btn amber" style="margin-top:10px;" onclick="gateSubmitMaterial()">Save — Logs In Now</button>
+    <button class="btn outline" onclick="closeGateMaterialModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Gate: shared camera modal -->
+<div class="modal-backdrop" id="gateCameraModal">
+  <div class="modal-box">
+    <h3>Capture Photo</h3>
+    <video id="gateCamVideo" class="cam-preview" autoplay playsinline></video>
+    <canvas id="gateCamCanvas"></canvas>
+    <button class="btn amber" onclick="captureGatePhoto()">📸 Capture</button>
+    <button class="btn outline" onclick="closeGateCamera()">Cancel</button>
+  </div>
+</div>
+
+<!-- Gate: video recorder modal -->
+<div class="modal-backdrop" id="gateVideoModal">
+  <div class="modal-box">
+    <h3>Record Video Clip (max 30 seconds)</h3>
+    <video id="gateVideoPreview" class="cam-preview" autoplay playsinline muted></video>
+    <div class="ocr-status" id="gateVideoRecStatus"></div>
+    <button class="btn amber" id="gateVideoRecordBtn" onclick="gateStartRecording()">⏺ Start Recording</button>
+    <button class="btn outline" onclick="closeGateVideoRecorder()">Cancel</button>
+  </div>
+</div>
 
 <!-- Assignment: enrollment result (QR + secret — shown once) -->
 <div class="modal-backdrop" id="asgEnrollResultModal">
@@ -2070,6 +2550,10 @@ function output(result, callback) {
     </div>
     <label class="field-label" id="asgAssignEmployeesLabel">Employee(s)</label>
     <div id="asgAssignEmployeeChips" class="chip-grid"></div>
+    <label style="display:flex; align-items:center; gap:8px; font-size:13.5px; margin-top:12px;">
+      <input type="checkbox" id="asgApplyRemainingSlots" style="width:auto;">
+      Apply this to the rest of today's slots too (for these same people)
+    </label>
     <button class="btn amber" style="margin-top:10px;" onclick="asgSubmitAssign()">Save</button>
     <button class="btn outline" onclick="closeAsgAssignModal()">Cancel</button>
   </div>
@@ -2184,9 +2668,11 @@ function openActivity(name){
   document.getElementById('receivingShell').style.display = name==='receiving' ? 'block' : 'none';
   document.getElementById('listPrepShell').style.display = name==='listprep' ? 'block' : 'none';
   document.getElementById('assignmentShell').style.display = name==='assignment' ? 'block' : 'none';
+  document.getElementById('gateShell').style.display = name==='gate' ? 'block' : 'none';
   if(name==='receiving') showTab('projects');
   if(name==='listprep') showLpTab('projects');
   if(name==='assignment') asgInit();
+  if(name==='gate') gateInit();
   window.scrollTo({top:0, behavior:'smooth'});
 }
 function goHome(){
@@ -2194,6 +2680,7 @@ function goHome(){
   document.getElementById('receivingShell').style.display = 'none';
   document.getElementById('listPrepShell').style.display = 'none';
   document.getElementById('assignmentShell').style.display = 'none';
+  document.getElementById('gateShell').style.display = 'none';
   window.scrollTo({top:0, behavior:'smooth'});
 }
 function showLpTab(name){
@@ -4640,6 +5127,10 @@ function exportListPrepExcel(id){
    of retyping.
    ============================================================ */
 const ASG_SECTIONS = ['Inspection & Flow Proving', 'MR/MRV & MIR'];
+const ASG_SUB_SECTIONS = {
+  'Inspection & Flow Proving': ['Inspection', 'Flow'],
+  'MR/MRV & MIR': ['MIR', 'MR/MRV / Receiving & Dispatch'],
+};
 let assignmentSheetId = '';
 let authSheetId = '';
 let assignmentScriptUrl = '';
@@ -4803,7 +5294,13 @@ function computeSlotsForDate(dateStr, model, granHours){
 }
 
 /* ---------- Roster ---------- */
+function asgRenderSubSectionChips(){
+  const opts = ASG_SUB_SECTIONS[asgActiveSection] || [];
+  document.getElementById('asgSubSectionChips').innerHTML = opts.map((s,i)=>
+    `<button type="button" class="${i===0?'selected':''}" onclick="[...this.parentElement.children].forEach(b=>b.classList.remove('selected')); this.classList.add('selected');">${s}</button>`).join('');
+}
 function asgLoadRoster(){
+  asgRenderSubSectionChips();
   jsonpRequest(assignmentScriptUrl, { action:'getRoster', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection }).then(data=>{
     asgRoster = (data && data.roster) || [];
     asgRenderTeamChips();
@@ -4812,14 +5309,16 @@ function asgLoadRoster(){
 }
 function asgAddRosterName(){
   const name = document.getElementById('asgNewRosterName').value.trim();
+  const subSectionBtn = document.querySelector('#asgSubSectionChips button.selected');
+  const subSection = subSectionBtn ? subSectionBtn.textContent : '';
   const statusEl = document.getElementById('asgRosterStatus');
   if(!name){ statusEl.textContent = 'Enter a name first.'; return; }
   statusEl.textContent = 'Adding…';
   fetch(assignmentScriptUrl, {
     method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'addRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name })
+    body: JSON.stringify({ action:'addRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name, subSection })
   }).then(()=>{
-    statusEl.textContent = `✓ Added "${name}" (unconfirmed — refreshing).`;
+    statusEl.textContent = `✓ Added "${name}" — ${subSection} (unconfirmed — refreshing).`;
     document.getElementById('asgNewRosterName').value = '';
     setTimeout(asgLoadRoster, 800);
   }).catch(()=>{ statusEl.textContent = '⚠ Could not add — check your connection.'; });
@@ -4827,8 +5326,8 @@ function asgAddRosterName(){
 
 /* ---------- Teams ---------- */
 function asgRenderTeamChips(){
-  document.getElementById('asgTeamMemberChips').innerHTML = asgRoster.map(emp=>
-    `<button type="button" onclick="this.classList.toggle('selected')">${emp}</button>`).join('');
+  document.getElementById('asgTeamMemberChips').innerHTML = asgRoster.map(r=>
+    `<button type="button" onclick="this.classList.toggle('selected')">${r.name}</button>`).join('');
 }
 function asgLoadTeams(){
   jsonpRequest(assignmentScriptUrl, { action:'getTeams', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection }).then(data=>{
@@ -4880,7 +5379,7 @@ function asgRenderTable(){
   }
   const rows = [
     ...asgTeams.map(t=>({ key:'team:'+t.teamName, label:'👥 '+t.teamName, isTeam:true, team:t })),
-    ...asgRoster.map(emp=>({ key:'emp:'+emp, label:emp, isTeam:false, emp })),
+    ...asgRoster.map(r=>({ key:'emp:'+r.name, label:`${r.name}${r.subSection ? `<div style="font-size:10px; font-weight:400; color:var(--muted);">${r.subSection}</div>` : ''}`, isTeam:false, emp:r.name })),
   ];
   const thead = `<tr><th style="position:sticky; left:0; background:var(--paper); z-index:1;">Who</th>${slots.map(s=>`<th>${s}</th>`).join('')}</tr>`;
   const tbody = rows.map(r=>{
@@ -4910,8 +5409,9 @@ function asgOpenAssignModal(slot, rowKey){
   document.getElementById('asgAssignModalTitle').textContent = `Assign — ${slot}`;
   document.getElementById('asgAssignTaskText').value = existing ? existing.task || '' : '';
   document.getElementById('asgAssignWorkDoneText').value = existing ? existing.workDone || '' : '';
-  document.getElementById('asgAssignEmployeeChips').innerHTML = asgRoster.map(emp=>
-    `<button type="button" class="${preselect.includes(emp)?'selected':''}" onclick="this.classList.toggle('selected')">${emp}</button>`).join('');
+  document.getElementById('asgAssignEmployeeChips').innerHTML = asgRoster.map(r=>
+    `<button type="button" class="${preselect.includes(r.name)?'selected':''}" onclick="this.classList.toggle('selected')">${r.name}</button>`).join('');
+  document.getElementById('asgApplyRemainingSlots').checked = false;
   document.getElementById('asgAssignModal').classList.add('open');
 }
 function closeAsgAssignModal(){ document.getElementById('asgAssignModal').classList.remove('open'); asgAssignCtx = null; }
@@ -4919,15 +5419,37 @@ function asgSubmitAssign(){
   const task = document.getElementById('asgAssignTaskText').value.trim();
   const workDone = document.getElementById('asgAssignWorkDoneText').value.trim();
   const employees = [...document.querySelectorAll('#asgAssignEmployeeChips button.selected')].map(b=>b.textContent);
+  const applyRemaining = document.getElementById('asgApplyRemainingSlots').checked;
   if(!task){ alert('Enter what they are assigned to do.'); return; }
   if(employees.length===0){ alert('Select at least one employee.'); return; }
   const date = document.getElementById('asgDate').value;
   const isTeam = asgAssignCtx.rowKey.indexOf('team:')===0;
   const groupTag = isTeam ? asgAssignCtx.rowKey.slice(5) : undefined;
-  fetch(assignmentScriptUrl, {
-    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'assignTask', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot:asgAssignCtx.slot, employees, task, groupTag })
-  }).then(()=>{
+
+  let targetSlots = [asgAssignCtx.slot];
+  if(applyRemaining){
+    const allSlots = computeSlotsForDate(date, asgSlotModel, asgGranularity);
+    const otherSlots = allSlots.filter(s=>s!==asgAssignCtx.slot);
+    const conflicts = [];
+    otherSlots.forEach(slot=>{
+      employees.forEach(emp=>{
+        const existing = asgFindAssignment(slot, emp);
+        if(existing && existing.task && existing.task!==task) conflicts.push(`${emp} in ${slot}: currently "${existing.task}"`);
+      });
+    });
+    if(conflicts.length>0){
+      const ok = confirm(`This will overwrite existing assignments in other slots today:\n\n${conflicts.join('\n')}\n\nContinue?`);
+      if(!ok) return;
+    }
+    targetSlots = allSlots;
+  }
+
+  Promise.all(targetSlots.map(slot=>
+    fetch(assignmentScriptUrl, {
+      method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({ action:'assignTask', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot, employees, task, groupTag })
+    })
+  )).then(()=>{
     if(!workDone){ closeAsgAssignModal(); setTimeout(asgLoadDate, 800); return; }
     Promise.all(employees.map(emp=>
       fetch(assignmentScriptUrl, {
@@ -4980,6 +5502,7 @@ function asgEnrollPerson(){
   const sections = [];
   if(document.getElementById('asgEnrollSec1').checked) sections.push(ASG_SECTIONS[0]);
   if(document.getElementById('asgEnrollSec2').checked) sections.push(ASG_SECTIONS[1]);
+  if(document.getElementById('asgEnrollSec3').checked) sections.push('Gate Entry');
   const statusEl = document.getElementById('asgEnrollStatus');
   if(!assignmentSheetId || !assignmentScriptUrl){ statusEl.textContent = '⚠ Save the Sheet ID / Script URL above first.'; return; }
   if(!personLabel){ statusEl.textContent = 'Enter a person label.'; return; }
@@ -4990,6 +5513,7 @@ function asgEnrollPerson(){
     statusEl.textContent = '✓ Enrolled.';
     document.getElementById('asgEnrollLabel').value=''; document.getElementById('asgEnrollRole').value='';
     document.getElementById('asgEnrollSec1').checked=false; document.getElementById('asgEnrollSec2').checked=false;
+    document.getElementById('asgEnrollSec3').checked=false;
     document.getElementById('asgEnrollSecretText').textContent = data.secret;
     document.getElementById('asgEnrollResultModal').classList.add('open');
     const canvas = document.getElementById('asgEnrollQrCanvas');
@@ -5032,6 +5556,396 @@ function asgRevokePerson(personLabel){
   jsonpRequest(assignmentScriptUrl, { action:'revokePerson', authSheetId, personLabel }).then(()=>{
     asgLoadPeopleList(); asgLoadPeopleListForLogin();
   }).catch(()=>{ alert('Could not revoke — check your connection.'); });
+}
+
+/* ============================================================
+   GATE ENTRY REGISTER — reuses Assignment/Duties' TOTP login
+   (Gate Entry is just a third possible "Allowed Section" value)
+   and its roster (both broad sections, combined, with sub-tags).
+   Its own data lives in Gate-StaffInOut / Gate-Visitors /
+   Gate-Material tabs in the same Assignment Sheet.
+   ============================================================ */
+let gateSessionToken = null;
+let gateSession = null;
+let gateRosterAll = [];
+let gateStaffToday = [];
+let gateVisitorsToday = [];
+let gateMaterialToday = [];
+let gatePhotos = [];
+let gateVideoBase64 = null;
+let gateReasonCtx = null;
+let gateCameraStream = null;
+let gateCameraTarget = null;
+let gateVideoStream = null;
+let gateMediaRecorder = null;
+let gateRecordedChunks = [];
+
+function gateInit(){
+  const dateEl = document.getElementById('gateDate');
+  if(dateEl && !dateEl.value) dateEl.value = new Date().toISOString().slice(0,10);
+  if(authSheetId) gateLoadPeopleListForLogin();
+  showGateTab('staff');
+}
+function showGateTab(name){
+  document.getElementById('gateTabStaff').style.display = name==='staff' ? 'block' : 'none';
+  document.getElementById('gateTabVisitors').style.display = name==='visitors' ? 'block' : 'none';
+  document.getElementById('gateTabMaterial').style.display = name==='material' ? 'block' : 'none';
+  document.getElementById('gateTabBtnStaff').classList.toggle('active', name==='staff');
+  document.getElementById('gateTabBtnVisitors').classList.toggle('active', name==='visitors');
+  document.getElementById('gateTabBtnMaterial').classList.toggle('active', name==='material');
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+/* ---------- Login (shares Assignment/Duties' Auth entirely) ---------- */
+function gateLoadPeopleListForLogin(){
+  if(!authSheetId || !assignmentScriptUrl) return;
+  jsonpRequest(assignmentScriptUrl, { action:'listAuthPeople', authSheetId }).then(data=>{
+    const sel = document.getElementById('gateLoginPerson');
+    const people = ((data && data.people) || []).filter(p=>p.status==='Active' && String(p.allowedSections||'').indexOf('Gate Entry')!==-1);
+    sel.innerHTML = '<option value="">— select —</option>' + people.map(p=>`<option value="${p.personLabel}">${p.personLabel}${p.role?' ('+p.role+')':''}</option>`).join('');
+  }).catch(()=>{});
+}
+function gateLogin(){
+  const personLabel = document.getElementById('gateLoginPerson').value;
+  const code = document.getElementById('gateLoginCode').value.trim();
+  const statusEl = document.getElementById('gateLoginStatus');
+  if(!authSheetId || !assignmentScriptUrl){ statusEl.textContent = '⚠ Set up the Assignment Sheet/Script from Assignment/Duties → Manage Access first.'; return; }
+  if(!personLabel || !code){ statusEl.textContent = 'Select your name and enter your 6-digit code.'; return; }
+  statusEl.textContent = 'Checking…';
+  jsonpRequest(assignmentScriptUrl, { action:'verifyTotp', authSheetId, personLabel, code }).then(data=>{
+    if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Login failed.'); return; }
+    if(data.allowedSections.indexOf('Gate Entry')===-1){ statusEl.textContent = '⚠ This account is not granted Gate Entry access — ask the owner to add it.'; return; }
+    gateSessionToken = data.token;
+    gateSession = { personLabel, role: data.role };
+    document.getElementById('gateLoginCode').value = '';
+    statusEl.textContent = '';
+    gateRenderWorkView();
+  }).catch(()=>{ statusEl.textContent = '⚠ Could not reach the server — check your connection.'; });
+}
+function gateLogout(){
+  gateSessionToken = null; gateSession = null;
+  document.getElementById('gateLoginBlock').style.display = 'block';
+  document.getElementById('gateWorkBlock').style.display = 'none';
+  document.getElementById('gateTag').textContent = 'Not logged in · SNGPL Faisalabad-D';
+  gateLoadPeopleListForLogin();
+}
+function gateRenderWorkView(){
+  document.getElementById('gateLoginBlock').style.display = 'none';
+  document.getElementById('gateWorkBlock').style.display = 'block';
+  document.getElementById('gateWhoAmI').textContent = `${gateSession.personLabel}${gateSession.role ? ' · '+gateSession.role : ''}`;
+  document.getElementById('gateTag').textContent = `${gateSession.personLabel} · SNGPL Faisalabad-D`;
+  gateLoadAll();
+}
+function gateLoadAll(){
+  gateLoadRosterAll();
+  gateLoadStaffToday();
+  gateLoadVisitorsToday();
+  gateLoadMaterialToday();
+}
+function gateLoadRosterAll(){
+  jsonpRequest(assignmentScriptUrl, { action:'getRosterBoth', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry' }).then(data=>{
+    const a = ((data && data.inspectionFlow) || []).map(r=>({ name:r.name, subSection:r.subSection }));
+    const b = ((data && data.mrMrvMir) || []).map(r=>({ name:r.name, subSection:r.subSection }));
+    gateRosterAll = a.concat(b);
+    gateRenderStaffList();
+  }).catch(()=>{});
+}
+
+/* ---------- Staff In/Out ---------- */
+function gateFindStaffRow(employee){
+  return gateStaffToday.find(r=>r.employee===employee);
+}
+function gateDetermineNextAction(row){
+  if(!row || !row.slot1In) return {direction:'in', slotIndex:1};
+  if(!row.slot1Out) return {direction:'out', slotIndex:1};
+  if(!row.slot2In) return {direction:'in', slotIndex:2};
+  if(!row.slot2Out) return {direction:'out', slotIndex:2};
+  if(!row.slot3In) return {direction:'in', slotIndex:3};
+  if(!row.slot3Out) return {direction:'out', slotIndex:3};
+  return null;
+}
+function gateRenderStaffList(){
+  const wrap = document.getElementById('gateStaffList');
+  if(gateRosterAll.length===0){ wrap.innerHTML = '<div class="subtext">No roster yet — add names from Assignment/Duties → Roster (shared with Gate Entry).</div>'; return; }
+  wrap.innerHTML = gateRosterAll.map(r=>{
+    const row = gateFindStaffRow(r.name);
+    const next = gateDetermineNextAction(row);
+    const statusColor = !row || !row.slot1In ? 'var(--muted)' : (next===null ? 'var(--ok)' : (next.direction==='out' ? 'var(--ok)' : 'var(--warn)'));
+    const statusText = !row || !row.slot1In ? 'Not arrived' : (next===null ? 'Day complete' : (next.direction==='out' ? 'Currently IN' : 'Currently OUT'));
+    const hoursText = row && row.availableHours ? ` · ${row.availableHours} available` : '';
+    const btnLabel = next===null ? 'Done' : (next.direction==='in' ? '↩ Check In' : '↪ Check Out');
+    return `<div class="pc-cloud" style="margin:0 0 8px;">
+      <div class="row" style="align-items:center; margin:0;">
+        <div style="flex:1;">
+          <div class="pc-name" style="font-size:15px;">${r.name}</div>
+          <div class="pc-meta">${r.subSection||''} · <span style="color:${statusColor}; font-weight:700;">${statusText}</span>${hoursText}</div>
+        </div>
+        <button class="btn ${next && next.direction==='in' ? 'amber' : 'outline'} small" style="flex:0 0 auto; width:auto;" ${next===null?'disabled':''} onclick="gateHandleStaffTap('${r.name.replace(/'/g,"\\'")}','${(r.subSection||'').replace(/'/g,"\\'")}')">${btnLabel}</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+function gateHandleStaffTap(employee, subSection){
+  const row = gateFindStaffRow(employee);
+  const next = gateDetermineNextAction(row);
+  if(!next) return;
+  if(next.direction==='in'){
+    let time = '';
+    if(next.slotIndex===1){
+      time = prompt(`Check-in time for ${employee} (24hr HH:MM):`, '08:15');
+      if(time===null) return;
+    }
+    gateSendStaffMove(employee, subSection, next.slotIndex, 'in', time);
+  } else {
+    gateReasonCtx = { employee, subSection, slotIndex: next.slotIndex };
+    document.getElementById('gateReasonWho').textContent = `${employee} — going out now`;
+    const group = document.getElementById('gateReasonChoice');
+    [...group.children].forEach(b=>b.classList.remove('on-ok','on-bad','on-neutral'));
+    const pre = group.querySelector('button[data-default="true"]');
+    if(pre){ applyToggleColor(pre, classifyToggleColor(group, pre.getAttribute('data-val'))); group.setAttribute('data-current', pre.getAttribute('data-val')); }
+    document.getElementById('gateReasonModal').classList.add('open');
+  }
+}
+function closeGateReasonModal(){ document.getElementById('gateReasonModal').classList.remove('open'); gateReasonCtx = null; }
+function gateSubmitOut(){
+  const reason = getToggleVal('gateReasonChoice') || 'Personal';
+  gateSendStaffMove(gateReasonCtx.employee, gateReasonCtx.subSection, gateReasonCtx.slotIndex, 'out', null, reason);
+  closeGateReasonModal();
+}
+function gateSendStaffMove(employee, subSection, slotIndex, direction, time, reason){
+  fetch(assignmentScriptUrl, {
+    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body: JSON.stringify({ action:'gateStaffMove', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry',
+      date:document.getElementById('gateDate').value, employee, subSection, slotIndex, direction, time, reason })
+  }).then(()=>{ setTimeout(gateLoadStaffToday, 800); }).catch(()=>{ alert('Could not send — check your connection.'); });
+}
+function gateLoadStaffToday(){
+  const date = document.getElementById('gateDate').value;
+  jsonpRequest(assignmentScriptUrl, { action:'gateGetStaffToday', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry', date }).then(data=>{
+    gateStaffToday = (data && data.rows) || [];
+    gateRenderStaffList();
+  }).catch(()=>{});
+}
+
+/* ---------- Visitors ---------- */
+function openGateVisitorModal(){
+  document.getElementById('gateVisitorName').value = '';
+  document.getElementById('gateVisitorId').value = '';
+  document.getElementById('gateVisitorPurpose').value = '';
+  gatePhotos = [];
+  document.getElementById('gateVisitorPhotoThumb').innerHTML = '';
+  const group = document.getElementById('gateVisitorType');
+  [...group.children].forEach(b=>b.classList.remove('on-ok','on-bad','on-neutral'));
+  const pre = group.querySelector('button[data-default="true"]');
+  if(pre){ applyToggleColor(pre, classifyToggleColor(group, pre.getAttribute('data-val'))); group.setAttribute('data-current', pre.getAttribute('data-val')); }
+  document.getElementById('gateVisitorModal').classList.add('open');
+}
+function closeGateVisitorModal(){ document.getElementById('gateVisitorModal').classList.remove('open'); }
+function gateSubmitVisitor(){
+  const name = document.getElementById('gateVisitorName').value.trim();
+  if(!name){ alert("Enter the visitor's name."); return; }
+  const visitorType = getToggleVal('gateVisitorType') || 'Consumer';
+  const idNo = document.getElementById('gateVisitorId').value.trim();
+  const purpose = document.getElementById('gateVisitorPurpose').value.trim();
+  const date = document.getElementById('gateDate').value;
+  compressList(gatePhotos, 1100, 0.6).then(photoB64=>{
+    fetch(assignmentScriptUrl, {
+      method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({ action:'gateAddVisitor', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry',
+        date, name, visitorType, idNo, purpose, photo:photoB64 })
+    }).then(()=>{ closeGateVisitorModal(); setTimeout(gateLoadVisitorsToday, 800); }).catch(()=>{ alert('Could not send.'); });
+  }).catch(()=>{ alert('Could not process photos.'); });
+}
+function gateLoadVisitorsToday(){
+  const date = document.getElementById('gateDate').value;
+  jsonpRequest(assignmentScriptUrl, { action:'gateGetVisitorsToday', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry', date }).then(data=>{
+    gateVisitorsToday = (data && data.rows) || [];
+    gateRenderVisitorList();
+  }).catch(()=>{});
+}
+function gateVisitorNextAction(row){
+  if(!row.slot1Out) return {direction:'out', slotIndex:1};
+  if(!row.slot2In) return {direction:'in', slotIndex:2};
+  if(!row.slot2Out) return {direction:'out', slotIndex:2};
+  if(!row.slot3In) return {direction:'in', slotIndex:3};
+  if(!row.slot3Out) return {direction:'out', slotIndex:3};
+  return null;
+}
+function gateRenderVisitorList(){
+  const wrap = document.getElementById('gateVisitorList');
+  if(gateVisitorsToday.length===0){ wrap.innerHTML = '<div class="subtext">No visitors logged yet today.</div>'; return; }
+  wrap.innerHTML = gateVisitorsToday.map(r=>{
+    const next = gateVisitorNextAction(r);
+    const statusText = next===null ? 'Left' : (next.direction==='out' ? 'Currently IN' : 'Currently OUT');
+    const btnLabel = next===null ? 'Done' : (next.direction==='in' ? '↩ Check In' : '↪ Check Out');
+    return `<div class="pc-cloud" style="margin:0 0 8px;">
+      <div class="row" style="align-items:center; margin:0;">
+        <div style="flex:1;">
+          <div class="pc-name" style="font-size:15px;">${r.name} <span style="font-size:11px; font-weight:400; color:var(--muted);">(${r.visitorType})</span></div>
+          <div class="pc-meta">${r.purpose||'-'} · ${statusText}</div>
+        </div>
+        <button class="btn ${next && next.direction==='in' ? 'amber' : 'outline'} small" style="flex:0 0 auto; width:auto;" ${next===null?'disabled':''} onclick="gateHandleVisitorTap(${r.sr})">${btnLabel}</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+function gateHandleVisitorTap(sr){
+  const row = gateVisitorsToday.find(r=>Number(r.sr)===Number(sr));
+  if(!row) return;
+  const next = gateVisitorNextAction(row);
+  if(!next) return;
+  fetch(assignmentScriptUrl, {
+    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body: JSON.stringify({ action:'gateVisitorMove', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry',
+      date:document.getElementById('gateDate').value, sr, slotIndex:next.slotIndex, direction:next.direction })
+  }).then(()=>{ setTimeout(gateLoadVisitorsToday, 800); }).catch(()=>{ alert('Could not send.'); });
+}
+
+/* ---------- Material / Asset ---------- */
+function gateUpdateMaterialFields(){
+  const type = getToggleVal('gateMaterialType') || 'MT';
+  document.getElementById('gateMaterialVehicleFields').style.display = type==='MT' ? 'block' : 'none';
+  document.getElementById('gateMaterialAssetFields').style.display = type==='AS' ? 'block' : 'none';
+}
+function openGateMaterialModal(){
+  ['gateMaterialName','gateMaterialQty','gateMaterialGatePass','gateMaterialVehicle','gateMaterialDriver','gateMaterialDept','gateMaterialRefPerson','gateMaterialRemarks'].forEach(id=>document.getElementById(id).value='');
+  gatePhotos = []; gateVideoBase64 = null;
+  document.getElementById('gateMaterialPhotoThumb').innerHTML = '';
+  document.getElementById('gateMaterialVideoStatus').textContent = '';
+  const group = document.getElementById('gateMaterialType');
+  [...group.children].forEach(b=>b.classList.remove('on-ok','on-bad','on-neutral'));
+  const pre = group.querySelector('button[data-default="true"]');
+  if(pre){ applyToggleColor(pre, classifyToggleColor(group, pre.getAttribute('data-val'))); group.setAttribute('data-current', pre.getAttribute('data-val')); }
+  gateUpdateMaterialFields();
+  document.getElementById('gateMaterialModal').classList.add('open');
+}
+function closeGateMaterialModal(){ document.getElementById('gateMaterialModal').classList.remove('open'); }
+function gateSubmitMaterial(){
+  const type = getToggleVal('gateMaterialType') || 'MT';
+  const materialName = document.getElementById('gateMaterialName').value.trim();
+  if(!materialName){ alert('Enter a material/asset name.'); return; }
+  const date = document.getElementById('gateDate').value;
+  const payload = {
+    action:'gateAddMaterial', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry', date,
+    type, materialName, quantity: document.getElementById('gateMaterialQty').value.trim(),
+    gatePassNo: document.getElementById('gateMaterialGatePass').value.trim(),
+    vehicleNo: document.getElementById('gateMaterialVehicle').value.trim(),
+    driverName: document.getElementById('gateMaterialDriver').value.trim(),
+    department: document.getElementById('gateMaterialDept').value.trim(),
+    referencePerson: document.getElementById('gateMaterialRefPerson').value.trim(),
+    remarks: document.getElementById('gateMaterialRemarks').value.trim(),
+  };
+  compressList(gatePhotos, 1100, 0.6).then(photoB64=>{
+    payload.photo = photoB64;
+    payload.video = gateVideoBase64 || undefined;
+    fetch(assignmentScriptUrl, {
+      method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify(payload)
+    }).then(()=>{ closeGateMaterialModal(); setTimeout(gateLoadMaterialToday, 800); }).catch(()=>{ alert('Could not send.'); });
+  }).catch(()=>{ alert('Could not process photos.'); });
+}
+function gateLoadMaterialToday(){
+  const date = document.getElementById('gateDate').value;
+  jsonpRequest(assignmentScriptUrl, { action:'gateGetMaterialToday', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry', date }).then(data=>{
+    gateMaterialToday = (data && data.rows) || [];
+    gateRenderMaterialList();
+  }).catch(()=>{});
+}
+function gateRenderMaterialList(){
+  const wrap = document.getElementById('gateMaterialList');
+  if(gateMaterialToday.length===0){ wrap.innerHTML = '<div class="subtext">No entries logged yet today.</div>'; return; }
+  wrap.innerHTML = gateMaterialToday.map(r=>{
+    const isOut = !!r.outTime;
+    return `<div class="pc-cloud" style="margin:0 0 8px;">
+      <div class="row" style="align-items:center; margin:0;">
+        <div style="flex:1;">
+          <div class="pc-name" style="font-size:15px;">${r.materialName}</div>
+          <div class="pc-meta">${r.type} · In ${r.inTime}${isOut ? ' · Out '+r.outTime : ''} · Qty ${r.quantity||'-'}</div>
+        </div>
+        ${isOut ? '' : `<button class="btn outline small" style="flex:0 0 auto; width:auto;" onclick="gateHandleMaterialOut(${r.sr})">↪ Log Out</button>`}
+      </div>
+    </div>`;
+  }).join('');
+}
+function gateHandleMaterialOut(sr){
+  fetch(assignmentScriptUrl, {
+    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body: JSON.stringify({ action:'gateMaterialOut', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry',
+      date:document.getElementById('gateDate').value, sr })
+  }).then(()=>{ setTimeout(gateLoadMaterialToday, 800); }).catch(()=>{ alert('Could not send.'); });
+}
+
+/* ---------- Shared camera (visitor + material photos) ---------- */
+function openGateCamera(target){
+  gateCameraTarget = target;
+  document.getElementById('gateCameraModal').classList.add('open');
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width:{ideal:1920}, height:{ideal:1080} } })
+    .then(stream=>{ gateCameraStream = stream; document.getElementById('gateCamVideo').srcObject = stream; })
+    .catch(err=>{ alert('Camera access failed: ' + err); closeGateCamera(); });
+}
+function closeGateCamera(){
+  document.getElementById('gateCameraModal').classList.remove('open');
+  if(gateCameraStream){ gateCameraStream.getTracks().forEach(t=>t.stop()); gateCameraStream = null; }
+}
+function captureGatePhoto(){
+  const video = document.getElementById('gateCamVideo');
+  const canvas = document.getElementById('gateCamCanvas');
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  gatePhotos.push(dataUrl);
+  const mode = gateCameraTarget==='visitor' ? 'gatevisitorphoto' : 'gatematerialphoto';
+  const containerId = gateCameraTarget==='visitor' ? 'gateVisitorPhotoThumb' : 'gateMaterialPhotoThumb';
+  renderPhotoThumbs(gatePhotos, containerId, mode);
+  closeGateCamera();
+}
+PHOTO_MODE_MAP.gatevisitorphoto = { list: () => gatePhotos, containerId: 'gateVisitorPhotoThumb' };
+PHOTO_MODE_MAP.gatematerialphoto = { list: () => gatePhotos, containerId: 'gateMaterialPhotoThumb' };
+
+/* ---------- Video clip recorder (Material/Asset only, ≤30s) ---------- */
+function openGateVideoRecorder(){
+  document.getElementById('gateVideoModal').classList.add('open');
+  document.getElementById('gateVideoRecStatus').textContent = '';
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: true })
+    .then(stream=>{ gateVideoStream = stream; document.getElementById('gateVideoPreview').srcObject = stream; })
+    .catch(err=>{ alert('Camera/microphone access failed: ' + err); closeGateVideoRecorder(); });
+}
+function closeGateVideoRecorder(){
+  document.getElementById('gateVideoModal').classList.remove('open');
+  if(gateMediaRecorder && gateMediaRecorder.state !== 'inactive') gateMediaRecorder.stop();
+  if(gateVideoStream){ gateVideoStream.getTracks().forEach(t=>t.stop()); gateVideoStream = null; }
+}
+function gateStartRecording(){
+  gateRecordedChunks = [];
+  const statusEl = document.getElementById('gateVideoRecStatus');
+  const btn = document.getElementById('gateVideoRecordBtn');
+  try{ gateMediaRecorder = new MediaRecorder(gateVideoStream, { mimeType: 'video/webm' }); }
+  catch(e){ statusEl.textContent = '⚠ Video recording not supported on this browser.'; return; }
+  gateMediaRecorder.ondataavailable = e=>{ if(e.data.size>0) gateRecordedChunks.push(e.data); };
+  gateMediaRecorder.onstop = ()=>{
+    const blob = new Blob(gateRecordedChunks, {type:'video/webm'});
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      gateVideoBase64 = reader.result.split(',')[1];
+      document.getElementById('gateMaterialVideoStatus').textContent = '✓ Video clip attached (' + Math.round(blob.size/1024) + ' KB).';
+    };
+    reader.readAsDataURL(blob);
+  };
+  gateMediaRecorder.start();
+  btn.textContent = '⏺ Recording… (auto-stops at 30s)';
+  btn.disabled = true;
+  statusEl.textContent = 'Recording…';
+  let secondsLeft = 30;
+  const countdown = setInterval(()=>{
+    secondsLeft--;
+    if(statusEl) statusEl.textContent = `Recording… ${secondsLeft}s left`;
+    if(secondsLeft<=0){
+      clearInterval(countdown);
+      if(gateMediaRecorder.state !== 'inactive') gateMediaRecorder.stop();
+      btn.textContent = '⏺ Start Recording'; btn.disabled = false;
+      closeGateVideoRecorder();
+    }
+  }, 1000);
 }
 
 updateReadout();
