@@ -839,6 +839,24 @@ function doPost(e) {
       .setMimeType(ContentService.MimeType.JSON);
   }
 
+  if (data.action === 'saveSafeLoadEntry') {
+    var slSheet = ss.getSheetByName('Safe Loading-Unloading');
+    if (!slSheet) {
+      slSheet = ss.insertSheet('Safe Loading-Unloading');
+      slSheet.appendRow(['Timestamp','Activity','MR No','Stacking','Dispatch Type','Document No (MRV/DA)',
+        'Device','Photo URLs','Video URL']);
+      slSheet.getRange(1,1,1,9).setFontWeight('bold').setBackground('#eef1f3');
+    }
+    var slPhotoUrls = uploadPhotos(data.photo, 'safeload');
+    var slVideoUrl = data.video ? uploadVideo(data.video, 'safeload') : '';
+    slSheet.appendRow([
+      new Date(), data.activity, data.mrNo || '', data.stacking || '', data.dispatchType || '',
+      data.docNo || '', data.device || '', slPhotoUrls, slVideoUrl
+    ]);
+    return ContentService.createTextOutput(JSON.stringify({status:'ok'}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
   var sheet = ss.getSheetByName('DMIS Receiving');
   if (!sheet) {
     sheet = ss.insertSheet('DMIS Receiving');
@@ -873,6 +891,44 @@ function doPost(e) {
         var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg',
           label + '_' + data.meterNo + '_' + (data.device || 'device') + '_' +
           new Date().getTime() + '_' + idx + '.jpg');
+        var file = folder.createFile(blob);
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        urls.push(file.getUrl());
+      });
+    } catch (err) {
+      return 'Upload error: ' + err.message;
+    }
+    return urls.join('\n');
+  }
+
+  // Safe Loading/Unloading uses its own folder — it isn't tied to a project/MRV the way
+  // Receiving entries are, so getProjectPhotoFolder()'s naming doesn't fit here.
+  function getSafeLoadFolder() {
+    var masterName = 'Safe Loading-Unloading Media';
+    var folders = DriveApp.getFoldersByName(masterName);
+    return folders.hasNext() ? folders.next() : DriveApp.createFolder(masterName);
+  }
+  function uploadVideo(base64Video, label) {
+    try {
+      var folder = getSafeLoadFolder();
+      var blob = Utilities.newBlob(Utilities.base64Decode(base64Video), 'video/webm',
+        label + '_' + new Date().getTime() + '.webm');
+      var file = folder.createFile(blob);
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      return file.getUrl();
+    } catch (err) {
+      return 'Video upload error: ' + err.message;
+    }
+  }
+  function uploadSafeLoadPhotos(base64Array, label) {
+    if (!base64Array || !base64Array.length) return '';
+    var urls = [];
+    try {
+      var folder = getSafeLoadFolder();
+      base64Array.forEach(function(b64, idx) {
+        if (!b64) return;
+        var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg',
+          label + '_' + new Date().getTime() + '_' + idx + '.jpg');
         var file = folder.createFile(blob);
         file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
         urls.push(file.getUrl());
@@ -5168,8 +5224,13 @@ function asgSaveConfig(){
   assignmentSheetId = document.getElementById('asgSheetIdInput').value.trim();
   authSheetId = document.getElementById('asgAuthSheetIdInput').value.trim();
   assignmentScriptUrl = document.getElementById('asgScriptUrlInput').value.trim();
+  try{
+    localStorage.setItem('dmis_assignmentSheetId', assignmentSheetId);
+    localStorage.setItem('dmis_authSheetId', authSheetId);
+    localStorage.setItem('dmis_assignmentScriptUrl', assignmentScriptUrl);
+  } catch(e){}
   document.getElementById('asgConfigStatus').textContent = (assignmentSheetId && authSheetId && assignmentScriptUrl)
-    ? '✓ Saved for this tab session — Assignment data and Auth are two separate Sheets, as configured.'
+    ? '✓ Saved — remembered on this device from now on, no need to re-enter or rescan next time you open the app.'
     : 'Enter all three: Assignment Sheet ID, Auth Sheet ID, and Script URL.';
   if(authSheetId){ asgLoadPeopleListForLogin(); asgLoadPeopleList(); }
 }
@@ -5955,6 +6016,19 @@ updateReadout();
   const regSheetId = params.get('registrySheetId');
   const entriesScript = params.get('entriesScript');
   if(regScript && regSheetId){ restoreProjectsFromRegistry(regScript, regSheetId, entriesScript); }
+})();
+(function restoreAssignmentConfig(){
+  try{
+    const savedSheetId = localStorage.getItem('dmis_assignmentSheetId');
+    const savedAuthId = localStorage.getItem('dmis_authSheetId');
+    const savedScriptUrl = localStorage.getItem('dmis_assignmentScriptUrl');
+    if(savedSheetId) assignmentSheetId = savedSheetId;
+    if(savedAuthId) authSheetId = savedAuthId;
+    if(savedScriptUrl) assignmentScriptUrl = savedScriptUrl;
+    if(savedSheetId) document.getElementById('asgSheetIdInput').value = savedSheetId;
+    if(savedAuthId) document.getElementById('asgAuthSheetIdInput').value = savedAuthId;
+    if(savedScriptUrl) document.getElementById('asgScriptUrlInput').value = savedScriptUrl;
+  } catch(e){}
 })();
 goHome();
 </script>
