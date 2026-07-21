@@ -1566,6 +1566,8 @@ function doGet(e) {
       <label class="field-label" style="margin-top:8px;">Sub-Section</label>
       <div class="chip-grid" id="asgSubSectionChips"></div>
       <div class="ocr-status" id="asgRosterStatus"></div>
+      <label class="field-label" style="margin-top:10px;">Current Roster (tap ✕ to remove)</label>
+      <div id="asgRosterList"></div>
     </div>
 
     <div class="card">
@@ -1589,6 +1591,15 @@ function doGet(e) {
         <button class="btn outline" onclick="asgPrintDate()">🖨 Print This Date</button>
         <button class="btn outline" onclick="asgLoadDate()">🔄 Refresh</button>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Today's Register</h2>
+      <div class="subtext">Consolidated, review-ready view — consecutive slots with the same task for the
+        same person merge into one line automatically, matching how the printed register reads. Updates the
+        moment an assignment is saved, right here — no need to open the Sheet to check.</div>
+      <div id="asgConsolidatedWrap" class="table-wrap"></div>
+      <button class="btn outline" style="margin-top:10px;" onclick="asgExportConsolidated()">⬇ Export This Register</button>
     </div>
   </div>
 </div>
@@ -1670,6 +1681,7 @@ function doPost(e) {
   if (a === 'revokePerson')      return output(revokePerson(data));
   if (a === 'verifyTotp')        return output(verifyTotpLogin(data));
   if (a === 'addRosterName')     return output(addRosterName(data));
+  if (a === 'removeRosterName')  return output(removeRosterName(data));
   if (a === 'assignTask')        return output(assignTask(data));
   if (a === 'reassignEmployee')  return output(reassignEmployee(data));
   if (a === 'saveProgress')      return output(saveProgress(data));
@@ -1697,6 +1709,8 @@ function doGet(e) {
   else if (a === 'getSlotModel')   result = withSession(p, function(sess){ return getSlotModel(p.sheetId, sess.section); });
   else if (a === 'getLog')         result = withSession(p, function(sess){ return { rows: getLog(p.sheetId, sess.section, p.date) }; });
   else if (a === 'getTeams')       result = withSession(p, function(sess){ return { teams: getTeams(p.sheetId, sess.section) }; });
+  else if (a === 'addRosterName')  result = addRosterName(p);
+  else if (a === 'removeRosterName') result = removeRosterName(p);
   else if (a === 'getRosterBoth')  result = withSession(p, function(sess){ return { inspectionFlow: getRoster(p.sheetId, 'Inspection & Flow Proving'), mrMrvMir: getRoster(p.sheetId, 'MR/MRV & MIR') }; });
   else if (a === 'gateGetStaffToday')    result = withSession(p, function(sess){ return { rows: gateGetStaffToday(p.sheetId, p.date) }; });
   else if (a === 'gateGetVisitorsToday') result = withSession(p, function(sess){ return { rows: gateGetVisitorsToday(p.sheetId, p.date) }; });
@@ -1891,11 +1905,28 @@ function getRoster(sheetId, section) {
 function addRosterName(data) {
   return withSession(data, function(sess){
     var sheet = getRosterSheet(data.sheetId, data.section);
-    var existing = getRoster(data.sheetId, data.section).map(function(r){ return r.name.toLowerCase(); });
-    if (existing.indexOf(String(data.name).trim().toLowerCase()) === -1) {
-      sheet.appendRow([data.name.trim(), data.subSection || '']);
+    var existing = getRoster(data.sheetId, data.section);
+    var newName = String(data.name).trim();
+    var dup = existing.some(function(r){ return r.name.toLowerCase() === newName.toLowerCase(); });
+    if (dup) {
+      return { status: 'error', message: 'A name matching "' + newName + '" is already on this roster (name matching ignores upper/lower case). ' +
+        'If this is genuinely a different person, add something to tell them apart — e.g. "' + newName + ' K." or "' + newName + ' (Store)" — then try again.' };
     }
+    sheet.appendRow([newName, data.subSection || '']);
     return { status: 'ok' };
+  });
+}
+function removeRosterName(data) {
+  return withSession(data, function(sess){
+    var sheet = getRosterSheet(data.sheetId, data.section);
+    var vals = sheet.getDataRange().getValues();
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][0]).trim().toLowerCase() === String(data.name).trim().toLowerCase()) {
+        sheet.deleteRow(i + 1);
+        return { status: 'ok' };
+      }
+    }
+    return { status: 'error', message: 'Name not found on this roster.' };
   });
 }
 
@@ -5364,9 +5395,27 @@ function asgLoadRoster(){
   asgRenderSubSectionChips();
   jsonpRequest(assignmentScriptUrl, { action:'getRoster', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection }).then(data=>{
     asgRoster = (data && data.roster) || [];
+    asgRenderRosterList();
     asgRenderTeamChips();
     asgLoadTeams();
   }).catch(()=>{});
+}
+function asgRenderRosterList(){
+  const wrap = document.getElementById('asgRosterList');
+  if(!wrap) return;
+  if(asgRoster.length===0){ wrap.innerHTML = '<div class="subtext">No one on this section\'s roster yet.</div>'; return; }
+  wrap.innerHTML = asgRoster.map(r=>`
+    <span class="pc-badge on" style="background:var(--steel); color:#fff; margin:0 6px 6px 0; display:inline-flex; align-items:center; gap:6px;">
+      ${r.name}${r.subSection ? ' · '+r.subSection : ''}
+      <span onclick="asgRemoveRosterName('${r.name.replace(/'/g,"\\'")}')" style="cursor:pointer; font-weight:700; padding:0 2px;" title="Remove">✕</span>
+    </span>`).join('');
+}
+function asgRemoveRosterName(name){
+  if(!confirm(`Remove "${name}" from this section's roster? Their past assignment history stays in the Sheet either way.`)) return;
+  jsonpRequest(assignmentScriptUrl, { action:'removeRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name }).then(data=>{
+    if(!data || data.status!=='ok'){ alert('⚠ ' + ((data&&data.message)||'Could not remove.')); return; }
+    asgLoadRoster();
+  }).catch(()=>{ alert('⚠ Could not remove — check your connection.'); });
 }
 function asgAddRosterName(){
   const name = document.getElementById('asgNewRosterName').value.trim();
@@ -5375,13 +5424,11 @@ function asgAddRosterName(){
   const statusEl = document.getElementById('asgRosterStatus');
   if(!name){ statusEl.textContent = 'Enter a name first.'; return; }
   statusEl.textContent = 'Adding…';
-  fetch(assignmentScriptUrl, {
-    method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'addRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name, subSection })
-  }).then(()=>{
-    statusEl.textContent = `✓ Added "${name}" — ${subSection} (unconfirmed — refreshing).`;
+  jsonpRequest(assignmentScriptUrl, { action:'addRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name, subSection }).then(data=>{
+    if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Could not add.'); return; }
+    statusEl.textContent = `✓ Added "${name}" — ${subSection}.`;
     document.getElementById('asgNewRosterName').value = '';
-    setTimeout(asgLoadRoster, 800);
+    asgLoadRoster();
   }).catch(()=>{ statusEl.textContent = '⚠ Could not add — check your connection.'; });
 }
 
@@ -5394,6 +5441,7 @@ function asgLoadTeams(){
   jsonpRequest(assignmentScriptUrl, { action:'getTeams', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection }).then(data=>{
     asgTeams = (data && data.teams) || [];
     asgRenderTable();
+    asgRenderConsolidated();
   }).catch(()=>{});
 }
 function asgCreateTeam(){
@@ -5422,6 +5470,7 @@ function asgLoadDate(){
   jsonpRequest(assignmentScriptUrl, { action:'getAssignments', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date }).then(data=>{
     asgAssignments = (data && data.rows) || [];
     asgRenderTable();
+    asgRenderConsolidated();
   }).catch(()=>{});
 }
 function asgFindAssignment(slot, employee){
@@ -5430,6 +5479,60 @@ function asgFindAssignment(slot, employee){
 function asgFindTeamAssignment(slot, teamName){
   return asgAssignments.find(r=>r.slot===slot && r.groupTag===teamName);
 }
+
+/* ---------- Consolidated Register — the "merged" view for review/export,
+   without physically merging cells in the underlying Sheet (which would
+   break reading assignments back out programmatically). Consecutive slots
+   with the same task AND the same Assigned/Reassigned-By collapse into one row. */
+function asgBuildConsolidatedRows(){
+  const dateVal = document.getElementById('asgDate').value;
+  if(!dateVal) return [];
+  const slots = computeSlotsForDate(dateVal, asgSlotModel, asgGranularity);
+  const rows = [];
+  function collapse(who, isTeam, findFn){
+    let i = 0;
+    while(i < slots.length){
+      const a = findFn(slots[i]);
+      if(!a || !a.task){ i++; continue; }
+      let j = i;
+      while(j+1 < slots.length){
+        const next = findFn(slots[j+1]);
+        if(next && next.task===a.task && next.assignedBy===a.assignedBy) j++;
+        else break;
+      }
+      rows.push({
+        who, isTeam,
+        slotLabel: i===j ? slots[i] : `${slots[i]} → ${slots[j]}`,
+        task: a.task, assignedBy: a.assignedBy || '', reassigned: Number(a.timesReassigned) > 0
+      });
+      i = j + 1;
+    }
+  }
+  asgRoster.forEach(r => collapse(r.name, false, slot => asgFindAssignment(slot, r.name)));
+  asgTeams.forEach(t => collapse(`👥 ${t.teamName} (${t.members.join(', ')})`, true, slot => asgFindTeamAssignment(slot, t.teamName)));
+  return rows;
+}
+function asgRenderConsolidated(){
+  const wrap = document.getElementById('asgConsolidatedWrap');
+  if(!wrap) return;
+  const rows = asgBuildConsolidatedRows();
+  if(rows.length===0){ wrap.innerHTML = '<div class="subtext">No assignments yet for this date.</div>'; return; }
+  wrap.innerHTML = `<table class="records"><thead><tr><th>Who</th><th>Slot(s)</th><th>Task</th><th>Assigned / Reassigned By</th></tr></thead><tbody>
+    ${rows.map(r=>`<tr><td>${r.who}</td><td>${r.slotLabel}</td><td>${r.task}</td><td>${r.assignedBy}${r.reassigned?' <span style="color:var(--warn); font-weight:700;">(reassigned)</span>':''}</td></tr>`).join('')}
+  </tbody></table>`;
+}
+function asgExportConsolidated(){
+  const rows = asgBuildConsolidatedRows();
+  const date = document.getElementById('asgDate').value;
+  const data = (rows.length ? rows : [{who:'(none)',slotLabel:'',task:'',assignedBy:'',reassigned:false}]).map(r=>({
+    'Who': r.who, 'Slot(s)': r.slotLabel, 'Task': r.task,
+    'Assigned / Reassigned By': r.assignedBy, 'Reassigned': r.reassigned ? 'Yes' : 'No'
+  }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data), 'Register');
+  XLSX.writeFile(wb, `Assignment_Register_${asgActiveSection.replace(/[^a-z0-9]/gi,'_')}_${date}.xlsx`);
+}
+
 function asgRenderTable(){
   const wrap = document.getElementById('asgTableWrap');
   if(!asgActiveSection || !document.getElementById('asgDate').value){ wrap.innerHTML=''; return; }
