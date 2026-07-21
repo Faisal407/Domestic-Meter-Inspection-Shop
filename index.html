@@ -1563,6 +1563,8 @@ function doGet(e) {
         <input type="text" id="asgNewRosterName" placeholder="Add a name to this section's roster">
         <button class="btn outline small" style="flex:0 0 70px;" onclick="asgAddRosterName()">Add</button>
       </div>
+      <label class="field-label" style="margin-top:8px;">Contact Number (optional)</label>
+      <input type="text" id="asgNewRosterContact" placeholder="e.g. 0300-1234567" inputmode="tel">
       <label class="field-label" style="margin-top:8px;">Sub-Section</label>
       <div class="chip-grid" id="asgSubSectionChips"></div>
       <div class="ocr-status" id="asgRosterStatus"></div>
@@ -2637,12 +2639,24 @@ function output(result, callback) {
     </div>
     <label class="field-label" id="asgAssignEmployeesLabel">Employee(s)</label>
     <div id="asgAssignEmployeeChips" class="chip-grid"></div>
+   <label class="field-label" style="margin-top:12px;">Attendance / Check-in Time (only used on first assignment of the day)</label>
+    <input type="text" id="asgCheckInTime" placeholder="08:15" value="08:15" inputmode="numeric">
+    <div class="subtext">Written to the Gate register as Slot-1 In, only if that person has no check-in yet today. Clear this box to skip.</div>
     <label style="display:flex; align-items:center; gap:8px; font-size:13.5px; margin-top:12px;">
       <input type="checkbox" id="asgApplyRemainingSlots" style="width:auto;">
-      Apply this to the rest of today's slots too (for these same people)
+      Apply this to the rest of today's WORKING-HOUR slots (Overtime is never included — assign OT by tapping its cell directly)
     </label>
     <button class="btn amber" style="margin-top:10px;" onclick="asgSubmitAssign()">Save</button>
     <button class="btn outline" onclick="closeAsgAssignModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- Assignment: reassignment history -->
+<div class="modal-backdrop" id="asgHistoryModal">
+  <div class="modal-box">
+    <h3 id="asgHistoryTitle">Reassignment History</h3>
+    <div id="asgHistoryBody" style="font-size:13.5px;"></div>
+    <button class="btn outline" onclick="document.getElementById('asgHistoryModal').classList.remove('open')">Close</button>
   </div>
 </div>
 
