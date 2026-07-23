@@ -1694,6 +1694,7 @@ function doPost(e) {
   if (a === 'gateVisitorMove')   return output(gateVisitorMove(data));
   if (a === 'gateAddMaterial')   return output(gateAddMaterial(data));
   if (a === 'gateMaterialOut')   return output(gateMaterialOut(data));
+  if (a === 'generateChit')      return output(generateChit(data));
   return output({status:'error', message:'Unknown action'});
 }
 
@@ -1713,10 +1714,17 @@ function doGet(e) {
   else if (a === 'getTeams')       result = withSession(p, function(sess){ return { teams: getTeams(p.sheetId, sess.section) }; });
   else if (a === 'addRosterName')  result = addRosterName(p);
   else if (a === 'removeRosterName') result = removeRosterName(p);
-  else if (a === 'getRosterBoth')  result = withSession(p, function(sess){ return { inspectionFlow: getRoster(p.sheetId, 'Inspection & Flow Proving'), mrMrvMir: getRoster(p.sheetId, 'MR/MRV & MIR') }; });
+  else if (a === 'getRosterBoth')  result = withSession(p, function(sess){
+    var out = { inspectionFlow: getRoster(p.sheetId, 'Inspection & Flow Proving'), mrMrvMir: getRoster(p.sheetId, 'MR/MRV & MIR') };
+    if (String(sess.role || '').trim().toLowerCase() === 'i/c dmis') out.icDmisOffice = getRoster(p.sheetId, 'I/C DMIS Office');
+    return out;
+  });
   else if (a === 'gateGetStaffToday')    result = withSession(p, function(sess){ return { rows: gateGetStaffToday(p.sheetId, p.date) }; });
   else if (a === 'gateGetVisitorsToday') result = withSession(p, function(sess){ return { rows: gateGetVisitorsToday(p.sheetId, p.date) }; });
   else if (a === 'gateGetMaterialToday') result = withSession(p, function(sess){ return { rows: gateGetMaterialToday(p.sheetId, p.date) }; });
+  else if (a === 'generateChit')   result = generateChit({ sheetId:p.sheetId, token:p.token, section:p.section, subSection:p.subSection, type:p.type, employeeName:p.employeeName, names:(p.names||'').split(',').filter(Boolean), purpose:p.purpose });
+  else if (a === 'listActiveChits') result = withSession(p, function(sess){ return { chits: listActiveChits(p.sheetId, p.section, p.subSection) }; });
+  else if (a === 'scanChit')       result = scanChit({ sheetId:p.sheetId, chitId:p.chitId }); // deliberately unauthenticated — see scanChit's own comment
   else result = { status: 'error', message: 'Unknown action' };
   return output(result, callback);
 }
@@ -1789,6 +1797,15 @@ function verifyTotpCode(secretBase32, code) {
    it back, and the token carries which section(s) it's allowed to
    touch, enforced here, not trusted from the client.
    ============================================================ */
+// Google Sheets auto-converts a date-like string ("2026-07-21") into a real Date value when
+// it's written to a cell — so reading it back and comparing as a plain string never matches.
+// Every date filter/lookup in this script must go through this first, on both sides of the
+// comparison, or writes will silently succeed while every date-filtered read comes up empty.
+function normalizeDateStr(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return String(v);
+}
+
 function makeToken() {
   return Utilities.getUuid() + '-' + Utilities.getUuid();
 }
@@ -1797,6 +1814,9 @@ function withSession(params, fn) {
   if (!sess) return { status: 'error', message: 'Session expired or invalid — please log in again.' };
   if (params.section && sess.allowedSections.indexOf(params.section) === -1) {
     return { status: 'error', message: 'Not allowed to access that section.' };
+  }
+  if (params.section === 'I/C DMIS Office' && String(sess.role || '').trim().toLowerCase() !== 'i/c dmis') {
+    return { status: 'error', message: 'I/C DMIS Office is only accessible to the account enrolled with that exact designation.' };
   }
   if (params.section) sess.section = params.section;
   return fn(sess);
@@ -2031,7 +2051,7 @@ function appendLog(sheetId, section, date, slot, employee, groupTag, actionName,
 }
 function findAssignRow(vals, date, slot, employee) {
   for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]) === String(date) && String(vals[i][1]) === String(slot) && String(vals[i][2]) === String(employee)) return i + 1;
+    if (normalizeDateStr(vals[i][0]) === normalizeDateStr(date) && String(vals[i][1]) === String(slot) && String(vals[i][2]) === String(employee)) return i + 1;
   }
   return -1;
 }
@@ -2040,7 +2060,7 @@ function getAssignments(sheetId, section, date) {
   var vals = sheet.getDataRange().getValues();
   var rows = [];
   for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]) !== String(date)) continue;
+    if (normalizeDateStr(vals[i][0]) !== normalizeDateStr(date)) continue;
     rows.push({
       date: vals[i][0], slot: vals[i][1], employee: vals[i][2], groupTag: vals[i][3], task: vals[i][4],
       assignedAt: vals[i][5], assignedBy: vals[i][6], timesReassigned: vals[i][7],
@@ -2054,7 +2074,7 @@ function getLog(sheetId, section, date) {
   var vals = sheet.getDataRange().getValues();
   var rows = [];
   for (var i = 1; i < vals.length; i++) {
-    if (date && String(vals[i][1]) !== String(date)) continue;
+    if (date && normalizeDateStr(vals[i][1]) !== normalizeDateStr(date)) continue;
     rows.push({ timestamp: vals[i][0], date: vals[i][1], slot: vals[i][2], employee: vals[i][3],
       groupTag: vals[i][4], action: vals[i][5], text: vals[i][6], enteredBy: vals[i][7], notes: vals[i][8] });
   }
@@ -2071,6 +2091,7 @@ function assignTask(data) {
         var vals = sheet.getDataRange().getValues();
         var rowIdx = findAssignRow(vals, data.date, data.slot, emp);
         var prevTask = rowIdx !== -1 ? String(vals[rowIdx - 1][4] || '') : '';
+        var prevGroupTag = rowIdx !== -1 ? String(vals[rowIdx - 1][3] || '') : '';
         var prevCount = rowIdx !== -1 ? (Number(vals[rowIdx - 1][7]) || 0) : 0;
         var isChange = prevTask && prevTask !== data.task;
         var newCount = isChange ? prevCount + 1 : prevCount;
@@ -2078,8 +2099,14 @@ function assignTask(data) {
         if (rowIdx === -1) sheet.appendRow(row);
         else sheet.getRange(rowIdx, 1, 1, 8).setValues([[data.date, data.slot, emp, groupTag, data.task, new Date(), sess.personLabel, newCount]]);
         var actionName = isChange ? 'Reassigned' : 'Assigned';
-        var logNotes = isChange ? ('Previous task: "' + prevTask + '"') : '';
+        var logNotes = '';
+        if (isChange) {
+          logNotes = 'Previous task: "' + prevTask + '"';
+          if (prevGroupTag && prevGroupTag !== groupTag) logNotes += ' — was part of team: ' + prevGroupTag;
+        }
         appendLog(data.sheetId, data.section, data.date, data.slot, emp, groupTag, actionName, data.task, sess.personLabel, logNotes);
+        var empSubSection = (data.subSections && data.subSections[emp]) || '';
+        setAttendanceIfMissing(data.sheetId, data.date, emp, empSubSection, data.attendanceTime);
       });
       return { status: 'ok' };
     } finally { lock.releaseLock(); }
@@ -2139,9 +2166,28 @@ function getGateStaffSheet(sheetId) {
 }
 function findGateStaffRow(vals, date, employee) {
   for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]) === String(date) && String(vals[i][1]) === String(employee)) return i + 1;
+    if (normalizeDateStr(vals[i][0]) === normalizeDateStr(date) && String(vals[i][1]) === String(employee)) return i + 1;
   }
   return -1;
+}
+// Called from assignTask — assigning someone work implies they're physically present, so this
+// is a natural moment to also confirm their attendance. Only ever sets Slot1 In if it's genuinely
+// still empty — never overwrites a real check-in time already logged at the gate.
+function setAttendanceIfMissing(sheetId, date, employee, subSection, time) {
+  try {
+    var sheet = getGateStaffSheet(sheetId);
+    var vals = sheet.getDataRange().getValues();
+    var rowIdx = findGateStaffRow(vals, date, employee);
+    if (rowIdx !== -1 && vals[rowIdx - 1][3]) return; // already has a Slot1 In — leave it alone
+    var timeVal = time || '08:15';
+    if (rowIdx === -1) {
+      sheet.appendRow([date, employee, subSection || '', timeVal, '', '', '', '', '', '', '', '', '', '']);
+    } else {
+      sheet.getRange(rowIdx, 4).setValue(timeVal);
+    }
+  } catch (err) {
+    // Never let an attendance-sync failure block the actual assignment save.
+  }
 }
 function gateTimeToMinutes(t) {
   if (!t) return null;
@@ -2212,7 +2258,7 @@ function gateGetStaffToday(sheetId, date) {
   var vals = sheet.getDataRange().getValues();
   var rows = [];
   for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]) !== String(date)) continue;
+    if (normalizeDateStr(vals[i][0]) !== normalizeDateStr(date)) continue;
     rows.push({
       date: vals[i][0], employee: vals[i][1], subSection: vals[i][2],
       slot1In: vals[i][3], slot1Out: vals[i][4], slot1Reason: vals[i][5],
@@ -2243,7 +2289,7 @@ function gateAddVisitor(data) {
       var sheet = getGateVisitorSheet(data.sheetId);
       var vals = sheet.getDataRange().getValues();
       var srCount = 0;
-      for (var i = 1; i < vals.length; i++) { if (String(vals[i][0]) === String(data.date)) srCount++; }
+      for (var i = 1; i < vals.length; i++) { if (normalizeDateStr(vals[i][0]) === normalizeDateStr(data.date)) srCount++; }
       var sr = srCount + 1;
       var photoUrls = uploadGateFiles(data.photo, 'visitor_' + data.name);
       var nowTime = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
@@ -2263,7 +2309,7 @@ function gateVisitorMove(data) {
       var vals = sheet.getDataRange().getValues();
       var rowIdx = -1;
       for (var i = 1; i < vals.length; i++) {
-        if (String(vals[i][0]) === String(data.date) && Number(vals[i][1]) === Number(data.sr)) { rowIdx = i + 1; break; }
+        if (normalizeDateStr(vals[i][0]) === normalizeDateStr(data.date) && Number(vals[i][1]) === Number(data.sr)) { rowIdx = i + 1; break; }
       }
       if (rowIdx === -1) return { status: 'error', message: 'Visitor not found for that date.' };
       var slotBase = 7 + (data.slotIndex - 1) * 2; // 1-indexed "In" column for this slot
@@ -2279,7 +2325,7 @@ function gateGetVisitorsToday(sheetId, date) {
   var vals = sheet.getDataRange().getValues();
   var rows = [];
   for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]) !== String(date)) continue;
+    if (normalizeDateStr(vals[i][0]) !== normalizeDateStr(date)) continue;
     rows.push({
       date: vals[i][0], sr: vals[i][1], name: vals[i][2], visitorType: vals[i][3], idNo: vals[i][4],
       purpose: vals[i][5], slot1In: vals[i][6], slot1Out: vals[i][7], slot2In: vals[i][8], slot2Out: vals[i][9],
@@ -2309,7 +2355,7 @@ function gateAddMaterial(data) {
       var sheet = getGateMaterialSheet(data.sheetId);
       var vals = sheet.getDataRange().getValues();
       var srCount = 0;
-      for (var i = 1; i < vals.length; i++) { if (String(vals[i][1]) === String(data.date)) srCount++; }
+      for (var i = 1; i < vals.length; i++) { if (normalizeDateStr(vals[i][1]) === normalizeDateStr(data.date)) srCount++; }
       var sr = srCount + 1;
       var fileUrls = uploadGateFiles(data.photo, 'material_' + (data.materialName || 'item'));
       if (data.video) {
@@ -2333,7 +2379,7 @@ function gateMaterialOut(data) {
       var vals = sheet.getDataRange().getValues();
       var rowIdx = -1;
       for (var i = 1; i < vals.length; i++) {
-        if (String(vals[i][1]) === String(data.date) && Number(vals[i][0]) === Number(data.sr)) { rowIdx = i + 1; break; }
+        if (normalizeDateStr(vals[i][1]) === normalizeDateStr(data.date) && Number(vals[i][0]) === Number(data.sr)) { rowIdx = i + 1; break; }
       }
       if (rowIdx === -1) return { status: 'error', message: 'Entry not found for that date.' };
       var timeVal = data.time || Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
@@ -2347,7 +2393,7 @@ function gateGetMaterialToday(sheetId, date) {
   var vals = sheet.getDataRange().getValues();
   var rows = [];
   for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][1]) !== String(date)) continue;
+    if (normalizeDateStr(vals[i][1]) !== normalizeDateStr(date)) continue;
     rows.push({
       sr: vals[i][0], date: vals[i][1], inTime: vals[i][2], outTime: vals[i][3], type: vals[i][4],
       materialName: vals[i][5], quantity: vals[i][6], gatePassNo: vals[i][7], vehicleNo: vals[i][8],
@@ -2356,6 +2402,124 @@ function gateGetMaterialToday(sheetId, date) {
     });
   }
   return rows;
+}
+
+/* ============================================================
+   GATE PASS CHITS — printed QR slips that let a physical chit,
+   not a typed code, authorize exactly one Out + one In movement.
+   Generating a chit still requires a normal TO/I-C-DMIS session.
+   SCANNING one deliberately does NOT — the chit itself, printed
+   only by an authorized person, IS the credential. Each chit is
+   valid for exactly 2 scans (1st = Out, 2nd = In), then void
+   forever. This never touches the day's first check-in/attendance
+   — that stays governed by the normal Gate Entry / Assignment flow.
+   ============================================================ */
+function getChitsSheet(sheetId) {
+  var ss = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('Gate-Chits');
+  if (!sheet) {
+    sheet = ss.insertSheet('Gate-Chits');
+    sheet.appendRow(['Chit ID','Section','Sub-Section','Type','Names','Purpose',
+      'Generated By','Generated At','Scan Count','Status','Last Scan At']);
+    sheet.getRange(1,1,1,11).setFontWeight('bold').setBackground('#eef1f3');
+  }
+  return sheet;
+}
+function isChitIssuerRole(role) {
+  var r = String(role || '').trim().toLowerCase();
+  return r === 'technical officer (metering)' || r === 'to (metering)' || r === 'i/c dmis';
+}
+function generateChit(data) {
+  return withSession(data, function(sess){
+    if (!isChitIssuerRole(sess.role)) {
+      return { status: 'error', message: 'Gate Pass Chits can only be generated by Technical Officer (Metering), TO (Metering), or I/C DMIS.' };
+    }
+    var names = data.type === 'team' ? (data.names || []) : [data.employeeName];
+    if (!names.length) return { status: 'error', message: 'No employee(s) specified for this chit.' };
+    var chitId = Utilities.getUuid();
+    var sheet = getChitsSheet(data.sheetId);
+    sheet.appendRow([chitId, data.section, data.subSection || '', data.type, names.join(', '),
+      data.purpose || '', sess.personLabel, new Date(), 0, 'Active', '']);
+    return { status: 'ok', chitId: chitId };
+  });
+}
+function listActiveChits(sheetId, section, subSection) {
+  var sheet = getChitsSheet(sheetId);
+  var vals = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][1]) !== String(section)) continue;
+    if (subSection && String(vals[i][2]) !== String(subSection)) continue;
+    out.push({ chitId: vals[i][0], section: vals[i][1], subSection: vals[i][2], type: vals[i][3],
+      names: vals[i][4], purpose: vals[i][5], generatedBy: vals[i][6], generatedAt: vals[i][7],
+      scanCount: vals[i][8], status: vals[i][9] });
+  }
+  return out;
+}
+// Deliberately NOT wrapped in withSession — this is the one action a device can call with zero
+// login, because physical possession of a chit printed by an authorized TO/I-C-DMIS IS the
+// credential here. Still fully server-validated: unknown/void/already-double-scanned chits are
+// rejected outright, and nothing else about the Sheet is exposed through this path.
+function scanChit(data) {
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(15000); } catch (e) { return { status: 'error', message: 'Server busy — try scanning again in a moment.' }; }
+  try {
+    var sheet = getChitsSheet(data.sheetId);
+    var vals = sheet.getDataRange().getValues();
+    var rowIdx = -1;
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][0]) === String(data.chitId)) { rowIdx = i + 1; break; }
+    }
+    if (rowIdx === -1) return { status: 'error', message: 'This pass was not recognized — it may be from a different Sheet setup.' };
+    var row = vals[rowIdx - 1];
+    var status = row[9];
+    var scanCount = Number(row[8]) || 0;
+    if (status !== 'Active' || scanCount >= 2) {
+      return { status: 'error', message: 'This pass has already been fully used (Out + In) and is no longer valid. Ask your Technical Officer for a new one.' };
+    }
+    var section = row[1], subSection = row[2], type = row[3];
+    var names = String(row[4] || '').split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+    var purpose = row[5];
+    var direction = scanCount === 0 ? 'out' : 'in';
+    var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    var results = [];
+    names.forEach(function(emp){
+      var gsheet = getGateStaffSheet(data.sheetId);
+      var gvals = gsheet.getDataRange().getValues();
+      var grow = findGateStaffRow(gvals, today, emp);
+      if (grow === -1) {
+        gsheet.appendRow([today, emp, subSection, '', '', '', '', '', '', '', '', '', '', '']);
+        grow = gsheet.getLastRow();
+        gvals = gsheet.getDataRange().getValues();
+      }
+      var next = gateDetermineNextActionServer(gvals[grow - 1]);
+      if (!next) { results.push({ employee: emp, skipped: true }); return; }
+      var slotBase = 4 + (next.slotIndex - 1) * 3;
+      var targetCol = next.direction === 'in' ? slotBase : slotBase + 1;
+      var timeVal = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'HH:mm');
+      gsheet.getRange(grow, targetCol).setValue(timeVal);
+      if (next.direction === 'out') gsheet.getRange(grow, slotBase + 2).setValue(purpose);
+      var freshRow = gsheet.getDataRange().getValues()[grow - 1];
+      gsheet.getRange(grow, 13).setValue(computeAvailableHours(freshRow));
+      results.push({ employee: emp, direction: next.direction, time: timeVal });
+    });
+    var newScanCount = scanCount + 1;
+    sheet.getRange(rowIdx, 9).setValue(newScanCount);
+    sheet.getRange(rowIdx, 11).setValue(new Date());
+    if (newScanCount >= 2) sheet.getRange(rowIdx, 10).setValue('Void — fully used');
+    return { status: 'ok', section: section, subSection: subSection, type: type, direction: direction, results: results };
+  } finally { lock.releaseLock(); }
+}
+// Server-side mirror of the client's gateDetermineNextAction — needed here since scanChit runs
+// with no session and can't call back into client JS.
+function gateDetermineNextActionServer(row) {
+  if (!row[3]) return { direction: 'in', slotIndex: 1 };
+  if (!row[4]) return { direction: 'out', slotIndex: 1 };
+  if (!row[6]) return { direction: 'in', slotIndex: 2 };
+  if (!row[7]) return { direction: 'out', slotIndex: 2 };
+  if (!row[9]) return { direction: 'in', slotIndex: 3 };
+  if (!row[10]) return { direction: 'out', slotIndex: 3 };
+  return null;
 }
 
 function getGatePhotoFolder() {
@@ -2419,7 +2583,11 @@ function output(result, callback) {
       <label style="display:flex; align-items:center; gap:6px; font-size:13.5px;">
         <input type="checkbox" id="asgEnrollSec3" style="width:auto;"> Gate Entry Register
       </label>
+      <label style="display:flex; align-items:center; gap:6px; font-size:13.5px;">
+        <input type="checkbox" id="asgEnrollSec4" style="width:auto;"> I/C DMIS Office
+      </label>
     </div>
+    <div class="subtext" style="margin-top:4px;">"I/C DMIS Office" only actually grants access if the Role field above is typed exactly as <code>I/C DMIS</code> — this is a deliberate second check, not just a checkbox.</div>
     <button class="btn amber" style="margin-top:10px;" onclick="asgEnrollPerson()">Enroll &amp; Generate Code</button>
     <div class="ocr-status" id="asgEnrollStatus"></div>
   </div>
@@ -2448,6 +2616,7 @@ function output(result, callback) {
     <button class="main-tab active" id="gateTabBtnStaff" onclick="showGateTab('staff')">👤 Staff</button>
     <button class="main-tab" id="gateTabBtnVisitors" onclick="showGateTab('visitors')">🧑‍🤝‍🧑 Visitors</button>
     <button class="main-tab" id="gateTabBtnMaterial" onclick="showGateTab('material')">📦 Material/Asset</button>
+    <button class="main-tab" id="gateTabBtnChits" onclick="showGateTab('chits')">🎫 Gate Pass Chits</button>
   </div>
 </header>
 
@@ -2484,7 +2653,12 @@ function output(result, callback) {
       <h2>Staff In / Out</h2>
       <div class="subtext">Tap a name to check them in or out. Slot 1 arrival defaults to 08:15 — editable.
         Up to 3 in/out cycles a day; the last Out recorded is their office departure time.</div>
-      <div id="gateStaffList"></div>
+      <div class="chip-grid" id="gateSubSectionTabs"></div>
+      <div id="gateStaffList" style="margin-top:10px;"></div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn outline" onclick="gatePrintSection()">🖨 Print This Sub-Section</button>
+        <button class="btn outline" onclick="gatePrintAllStaff()">🖨 Print Complete Staff Sheet</button>
+      </div>
     </div>
   </div>
 
@@ -2505,10 +2679,68 @@ function output(result, callback) {
       <div id="gateMaterialList" style="margin-top:10px;"></div>
     </div>
   </div>
+
+  <!-- ---- Gate Pass Chits tab ---- -->
+  <div id="gateTabChits" style="display:none;">
+    <div id="gateChitsNotAllowed" class="banner" style="display:none;">
+      Gate Pass Chits can only be generated by <b>Technical Officer (Metering)</b>, <b>TO (Metering)</b>,
+      or <b>I/C DMIS</b> — this account's Role doesn't match, so this tab is view-only here.
+    </div>
+    <div id="gateChitsFormBlock" class="card">
+      <h2>Generate a Gate Pass Chit</h2>
+      <div class="subtext">A printed chit's QR code is the credential — no login needed to use it at the
+        gate. Each one works for exactly one Out and one In, then it's permanently void. This never
+        affects the day's first check-in.</div>
+      <label class="field-label">Section (only sections you have access to)</label>
+      <div class="chip-grid" id="gateChitSectionChips"></div>
+      <label class="field-label" style="margin-top:8px;">Sub-Section</label>
+      <div class="chip-grid" id="gateChitSubSectionChips"></div>
+      <label class="field-label" style="margin-top:8px;">For</label>
+      <div class="doc-select-group" id="gateChitTypeChoice" data-neutral="true">
+        <button data-val="individual" data-default="true" onclick="gateRenderChitTargetChips()">Individual</button>
+        <button data-val="team" onclick="gateRenderChitTargetChips()">Team</button>
+      </div>
+      <label class="field-label" style="margin-top:8px;" id="gateChitTargetLabel">Employee</label>
+      <div class="chip-grid" id="gateChitTargetChips"></div>
+      <label class="field-label" style="margin-top:8px;">Purpose</label>
+      <div class="doc-select-group" id="gateChitPurposeChoice" data-neutral="true">
+        <button data-val="Personal" data-default="true">Personal</button>
+        <button data-val="Store Faisalabad-D">Store Faisalabad-D</button>
+        <button data-val="Distribution Section">Distribution Section (Meter Receiving Cross-Check)</button>
+      </div>
+      <button class="btn amber" style="margin-top:10px;" onclick="gateGenerateChit()">➕ Add to Print Batch</button>
+      <div class="ocr-status" id="gateChitStatus"></div>
+      <div class="subtext" style="margin-top:8px;" id="gateChitBatchCount">No chits queued yet.</div>
+      <button class="btn outline" onclick="gateOpenChitPrintView()">🖨 Print Queued Chits (5 per A4 page)</button>
+      <button class="btn outline" style="color:var(--warn); border-color:var(--warn);" onclick="gateClearChitBatch()">Clear Batch</button>
+    </div>
+  </div>
 </div>
 
 </main>
 </div> <!-- /#gateShell -->
+
+<!-- Gate: printable chit sheet, 5 per A4 portrait page -->
+<div class="modal-backdrop" id="gateChitPrintModal">
+  <div class="modal-box" style="max-width:820px;">
+    <h3>Printable Gate Pass Chits</h3>
+    <div id="gateChitPrintArea"></div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn amber" onclick="window.print()">🖨 Print</button>
+      <button class="btn outline" onclick="closeGateChitPrintModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Gate: no-login chit-scan result screen — this is the ONLY screen a scanning device sees;
+     it never gains any other access to the app's data. -->
+<div id="gateChitScanScreen" style="display:none; min-height:100vh; background:var(--paper); padding:24px 18px;">
+  <div class="card" style="max-width:480px; margin:40px auto;">
+    <h2 style="text-align:center;">DMIS Gate Pass</h2>
+    <div id="gateChitScanResult" style="text-align:center; font-size:16px; margin-top:16px;">Checking pass…</div>
+  </div>
+</div>
+
 
 <!-- Gate: staff Out reason picker -->
 <div class="modal-backdrop" id="gateReasonModal">
@@ -2608,6 +2840,32 @@ function output(result, callback) {
   </div>
 </div>
 
+<!-- Gate: re-authenticate before printing (required even while already logged in) -->
+<div class="modal-backdrop" id="gateReauthModal">
+  <div class="modal-box">
+    <h3>Confirm Your Code to Print</h3>
+    <div class="subtext">Printing produces an official document, so it asks for a fresh Authenticator code
+      even though you're already signed in.</div>
+    <label class="field-label">6-digit Code</label>
+    <input type="text" id="gateReauthCode" placeholder="123456" inputmode="numeric" maxlength="6">
+    <button class="btn amber" onclick="gateSubmitReauth()">Confirm &amp; Print</button>
+    <button class="btn outline" onclick="closeGateReauthModal()">Cancel</button>
+    <div class="ocr-status" id="gateReauthStatus"></div>
+  </div>
+</div>
+
+<!-- Gate: printable staff view -->
+<div class="modal-backdrop" id="gatePrintModal">
+  <div class="modal-box" style="max-width:700px;">
+    <h3>Printable Staff Sheet</h3>
+    <div id="gatePrintArea"></div>
+    <div class="row" style="margin-top:12px;">
+      <button class="btn amber" onclick="window.print()">🖨 Print</button>
+      <button class="btn outline" onclick="closeGatePrintModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Assignment: enrollment result (QR + secret — shown once) -->
 <div class="modal-backdrop" id="asgEnrollResultModal">
   <div class="modal-box">
@@ -2632,6 +2890,8 @@ function output(result, callback) {
     <textarea id="asgAssignTaskText" rows="2" placeholder="What are they assigned to do?"></textarea>
     <label class="field-label">Work Done (optional — fill in later, or now if already known)</label>
     <textarea id="asgAssignWorkDoneText" rows="2" placeholder="What did they actually do…"></textarea>
+    <label class="field-label">Check-in Time (optional — sets today's Gate Entry attendance if not already recorded there)</label>
+    <input type="text" id="asgAssignAttendanceTime" placeholder="Defaults to 08:15 if left blank">
     <div class="subtext" style="margin-top:8px;">
       <b>To group people on one task:</b> tap each of their names below so all the ones doing this
       together are highlighted, then Save. Only the person you opened this from is pre-selected —
@@ -2639,24 +2899,14 @@ function output(result, callback) {
     </div>
     <label class="field-label" id="asgAssignEmployeesLabel">Employee(s)</label>
     <div id="asgAssignEmployeeChips" class="chip-grid"></div>
-   <label class="field-label" style="margin-top:12px;">Attendance / Check-in Time (only used on first assignment of the day)</label>
-    <input type="text" id="asgCheckInTime" placeholder="08:15" value="08:15" inputmode="numeric">
-    <div class="subtext">Written to the Gate register as Slot-1 In, only if that person has no check-in yet today. Clear this box to skip.</div>
-    <label style="display:flex; align-items:center; gap:8px; font-size:13.5px; margin-top:12px;">
-      <input type="checkbox" id="asgApplyRemainingSlots" style="width:auto;">
-      Apply this to the rest of today's WORKING-HOUR slots (Overtime is never included — assign OT by tapping its cell directly)
-    </label>
+    <div id="asgApplyRemainingWrap">
+      <label style="display:flex; align-items:center; gap:8px; font-size:13.5px; margin-top:12px;">
+        <input type="checkbox" id="asgApplyRemainingSlots" style="width:auto;">
+        Apply this to the rest of today's working-hours slots too (never includes Overtime — that's always assigned separately)
+      </label>
+    </div>
     <button class="btn amber" style="margin-top:10px;" onclick="asgSubmitAssign()">Save</button>
     <button class="btn outline" onclick="closeAsgAssignModal()">Cancel</button>
-  </div>
-</div>
-
-<!-- Assignment: reassignment history -->
-<div class="modal-backdrop" id="asgHistoryModal">
-  <div class="modal-box">
-    <h3 id="asgHistoryTitle">Reassignment History</h3>
-    <div id="asgHistoryBody" style="font-size:13.5px;"></div>
-    <button class="btn outline" onclick="document.getElementById('asgHistoryModal').classList.remove('open')">Close</button>
   </div>
 </div>
 
@@ -5228,6 +5478,7 @@ function exportListPrepExcel(id){
    of retyping.
    ============================================================ */
 const ASG_SECTIONS = ['Inspection & Flow Proving', 'MR/MRV & MIR'];
+const ASG_ICDMIS_SECTION = 'I/C DMIS Office';
 const ASG_SUB_SECTIONS = {
   'Inspection & Flow Proving': ['Inspection', 'Flow'],
   'MR/MRV & MIR': ['MIR', 'MR/MRV / Receiving & Dispatch'],
@@ -5317,15 +5568,17 @@ function asgRenderWorkView(){
   document.getElementById('asgWorkBlock').style.display = 'block';
   document.getElementById('asgWhoAmI').textContent = `${asgSession.personLabel}${asgSession.role ? ' · '+asgSession.role : ''}`;
   document.getElementById('asgTag').textContent = `${asgSession.personLabel} · SNGPL Faisalabad-D`;
+  const isICDMIS = String(asgSession.role||'').trim().toLowerCase() === 'i/c dmis';
+  const visibleSections = asgSession.allowedSections.filter(s => s !== ASG_ICDMIS_SECTION || isICDMIS);
   const picker = document.getElementById('asgSectionPicker');
-  if(asgSession.allowedSections.length > 1){
+  if(visibleSections.length > 1){
     picker.style.display = 'block';
-    document.getElementById('asgSectionChips').innerHTML = asgSession.allowedSections.map(s=>
+    document.getElementById('asgSectionChips').innerHTML = visibleSections.map(s=>
       `<button type="button" onclick="asgSelectSection('${s.replace(/'/g,"\\'")}')">${s}</button>`).join('');
-    asgSelectSection(asgSession.allowedSections[0]);
+    asgSelectSection(visibleSections[0]);
   } else {
     picker.style.display = 'none';
-    asgSelectSection(asgSession.allowedSections[0] || ASG_SECTIONS[0]);
+    asgSelectSection(visibleSections[0] || ASG_SECTIONS[0]);
   }
 }
 function asgSelectSection(section){
@@ -5420,7 +5673,7 @@ function asgRenderRosterList(){
   if(asgRoster.length===0){ wrap.innerHTML = '<div class="subtext">No one on this section\'s roster yet.</div>'; return; }
   wrap.innerHTML = asgRoster.map(r=>`
     <span class="pc-badge on" style="background:var(--steel); color:#fff; margin:0 6px 6px 0; display:inline-flex; align-items:center; gap:6px;">
-      ${r.name}${r.subSection ? ' · '+r.subSection : ''}
+      ${r.name}${r.subSection ? ' · '+r.subSection : ''}${r.contactNo ? ' · '+r.contactNo : ''}
       <span onclick="asgRemoveRosterName('${r.name.replace(/'/g,"\\'")}')" style="cursor:pointer; font-weight:700; padding:0 2px;" title="Remove">✕</span>
     </span>`).join('');
 }
@@ -5433,15 +5686,17 @@ function asgRemoveRosterName(name){
 }
 function asgAddRosterName(){
   const name = document.getElementById('asgNewRosterName').value.trim();
+  const contactNo = document.getElementById('asgNewRosterContact').value.trim();
   const subSectionBtn = document.querySelector('#asgSubSectionChips button.selected');
   const subSection = subSectionBtn ? subSectionBtn.textContent : '';
   const statusEl = document.getElementById('asgRosterStatus');
   if(!name){ statusEl.textContent = 'Enter a name first.'; return; }
   statusEl.textContent = 'Adding…';
-  jsonpRequest(assignmentScriptUrl, { action:'addRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name, subSection }).then(data=>{
+  jsonpRequest(assignmentScriptUrl, { action:'addRosterName', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, name, subSection, contactNo }).then(data=>{
     if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Could not add.'); return; }
     statusEl.textContent = `✓ Added "${name}" — ${subSection}.`;
     document.getElementById('asgNewRosterName').value = '';
+    document.getElementById('asgNewRosterContact').value = '';
     asgLoadRoster();
   }).catch(()=>{ statusEl.textContent = '⚠ Could not add — check your connection.'; });
 }
@@ -5486,6 +5741,7 @@ function asgLoadDate(){
     asgRenderTable();
     asgRenderConsolidated();
   }).catch(()=>{});
+  asgLoadLogForDate();
 }
 function asgFindAssignment(slot, employee){
   return asgAssignments.find(r=>r.slot===slot && r.employee===employee);
@@ -5498,12 +5754,31 @@ function asgFindTeamAssignment(slot, teamName){
    without physically merging cells in the underlying Sheet (which would
    break reading assignments back out programmatically). Consecutive slots
    with the same task AND the same Assigned/Reassigned-By collapse into one row. */
+let asgLogToday = [];
+function asgLoadLogForDate(){
+  const date = document.getElementById('asgDate').value;
+  if(!date || !asgActiveSection) return;
+  jsonpRequest(assignmentScriptUrl, { action:'getLog', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date }).then(data=>{
+    asgLogToday = (data && data.rows) || [];
+    asgRenderConsolidated();
+  }).catch(()=>{});
+}
+function asgFindReassignLogEntry(key, isTeam, slot){
+  const matches = asgLogToday.filter(l=>l.slot===slot && l.action==='Reassigned' && (isTeam ? l.groupTag===key : l.employee===key));
+  return matches.length ? matches[matches.length-1] : null;
+}
+function asgShowReassignHistory(key, isTeamStr, slot){
+  const isTeam = isTeamStr === 'true' || isTeamStr === true;
+  const entry = asgFindReassignLogEntry(key, isTeam, slot);
+  if(!entry){ alert('No reassignment detail found in the Log for this entry.'); return; }
+  alert(`Reassignment — ${key} (${slot})\n\n${entry.notes || 'No further detail recorded.'}\n\nNew task: ${entry.text}\nChanged by: ${entry.enteredBy}`);
+}
 function asgBuildConsolidatedRows(){
   const dateVal = document.getElementById('asgDate').value;
   if(!dateVal) return [];
   const slots = computeSlotsForDate(dateVal, asgSlotModel, asgGranularity);
   const rows = [];
-  function collapse(who, isTeam, findFn){
+  function collapse(who, isTeam, rawName, findFn){
     let i = 0;
     while(i < slots.length){
       const a = findFn(slots[i]);
@@ -5514,16 +5789,19 @@ function asgBuildConsolidatedRows(){
         if(next && next.task===a.task && next.assignedBy===a.assignedBy) j++;
         else break;
       }
+      const multi = i !== j;
       rows.push({
-        who, isTeam,
-        slotLabel: i===j ? slots[i] : `${slots[i]} → ${slots[j]}`,
+        who, isTeam, rawName,
+        slotLabel: multi ? `${slots[i]} → ${slots[j]}` : slots[i],
+        lastSlot: slots[j],
+        remarks: multi ? `Task assigned across ${slots[i]} through ${slots[j]}` : '',
         task: a.task, assignedBy: a.assignedBy || '', reassigned: Number(a.timesReassigned) > 0
       });
       i = j + 1;
     }
   }
-  asgRoster.forEach(r => collapse(r.name, false, slot => asgFindAssignment(slot, r.name)));
-  asgTeams.forEach(t => collapse(`👥 ${t.teamName} (${t.members.join(', ')})`, true, slot => asgFindTeamAssignment(slot, t.teamName)));
+  asgRoster.forEach(r => collapse(r.name, false, r.name, slot => asgFindAssignment(slot, r.name)));
+  asgTeams.forEach(t => collapse(`👥 ${t.teamName} (${t.members.join(', ')})`, true, t.teamName, slot => asgFindTeamAssignment(slot, t.teamName)));
   return rows;
 }
 function asgRenderConsolidated(){
@@ -5531,15 +5809,15 @@ function asgRenderConsolidated(){
   if(!wrap) return;
   const rows = asgBuildConsolidatedRows();
   if(rows.length===0){ wrap.innerHTML = '<div class="subtext">No assignments yet for this date.</div>'; return; }
-  wrap.innerHTML = `<table class="records"><thead><tr><th>Who</th><th>Slot(s)</th><th>Task</th><th>Assigned / Reassigned By</th></tr></thead><tbody>
-    ${rows.map(r=>`<tr><td>${r.who}</td><td>${r.slotLabel}</td><td>${r.task}</td><td>${r.assignedBy}${r.reassigned?' <span style="color:var(--warn); font-weight:700;">(reassigned)</span>':''}</td></tr>`).join('')}
+  wrap.innerHTML = `<table class="records"><thead><tr><th>Who</th><th>Slot(s)</th><th>Task</th><th>Remarks</th><th>Assigned By</th></tr></thead><tbody>
+    ${rows.map(r=>`<tr><td>${r.who}</td><td>${r.slotLabel}</td><td>${r.task}</td><td>${r.remarks||'-'}</td><td>${r.assignedBy}${r.reassigned?` <button class="pill-btn secondary" style="padding:2px 8px; font-size:11px; margin-left:4px;" onclick="asgShowReassignHistory('${r.rawName.replace(/'/g,"\\'")}',${r.isTeam},'${r.lastSlot.replace(/'/g,"\\'")}')">Reassigned</button>`:''}</td></tr>`).join('')}
   </tbody></table>`;
 }
 function asgExportConsolidated(){
   const rows = asgBuildConsolidatedRows();
   const date = document.getElementById('asgDate').value;
-  const data = (rows.length ? rows : [{who:'(none)',slotLabel:'',task:'',assignedBy:'',reassigned:false}]).map(r=>({
-    'Who': r.who, 'Slot(s)': r.slotLabel, 'Task': r.task,
+  const data = (rows.length ? rows : [{who:'(none)',slotLabel:'',task:'',remarks:'',assignedBy:'',reassigned:false}]).map(r=>({
+    'Who': r.who, 'Slot(s)': r.slotLabel, 'Task': r.task, 'Remarks': r.remarks,
     'Assigned / Reassigned By': r.assignedBy, 'Reassigned': r.reassigned ? 'Yes' : 'No'
   }));
   const wb = XLSX.utils.book_new();
@@ -5587,15 +5865,19 @@ function asgOpenAssignModal(slot, rowKey){
   document.getElementById('asgAssignModalTitle').textContent = `Assign — ${slot}`;
   document.getElementById('asgAssignTaskText').value = existing ? existing.task || '' : '';
   document.getElementById('asgAssignWorkDoneText').value = existing ? existing.workDone || '' : '';
+  document.getElementById('asgAssignAttendanceTime').value = '';
   document.getElementById('asgAssignEmployeeChips').innerHTML = asgRoster.map(r=>
     `<button type="button" class="${preselect.includes(r.name)?'selected':''}" onclick="this.classList.toggle('selected')">${r.name}</button>`).join('');
   document.getElementById('asgApplyRemainingSlots').checked = false;
+  const isOvertimeSlot = slot.indexOf('Overtime') === 0;
+  document.getElementById('asgApplyRemainingWrap').style.display = isOvertimeSlot ? 'none' : 'block';
   document.getElementById('asgAssignModal').classList.add('open');
 }
 function closeAsgAssignModal(){ document.getElementById('asgAssignModal').classList.remove('open'); asgAssignCtx = null; }
 function asgSubmitAssign(){
   const task = document.getElementById('asgAssignTaskText').value.trim();
   const workDone = document.getElementById('asgAssignWorkDoneText').value.trim();
+  const attendanceTime = document.getElementById('asgAssignAttendanceTime').value.trim();
   const employees = [...document.querySelectorAll('#asgAssignEmployeeChips button.selected')].map(b=>b.textContent);
   const applyRemaining = document.getElementById('asgApplyRemainingSlots').checked;
   if(!task){ alert('Enter what they are assigned to do.'); return; }
@@ -5603,10 +5885,16 @@ function asgSubmitAssign(){
   const date = document.getElementById('asgDate').value;
   const isTeam = asgAssignCtx.rowKey.indexOf('team:')===0;
   const groupTag = isTeam ? asgAssignCtx.rowKey.slice(5) : undefined;
+  const subSections = {};
+  employees.forEach(emp=>{
+    const r = asgRoster.find(x=>x.name===emp);
+    if(r) subSections[emp] = r.subSection || '';
+  });
 
   let targetSlots = [asgAssignCtx.slot];
   if(applyRemaining){
-    const allSlots = computeSlotsForDate(date, asgSlotModel, asgGranularity);
+    // Overtime is always a separate, deliberate allocation — never swept up by "apply to remaining slots."
+    const allSlots = computeSlotsForDate(date, asgSlotModel, asgGranularity).filter(s=>s.indexOf('Overtime')!==0);
     const otherSlots = allSlots.filter(s=>s!==asgAssignCtx.slot);
     const conflicts = [];
     otherSlots.forEach(slot=>{
@@ -5616,7 +5904,7 @@ function asgSubmitAssign(){
       });
     });
     if(conflicts.length>0){
-      const ok = confirm(`This will overwrite existing assignments in other slots today:\n\n${conflicts.join('\n')}\n\nContinue?`);
+      const ok = confirm(`This will overwrite existing assignments in other slots today (Overtime is never included):\n\n${conflicts.join('\n')}\n\nContinue?`);
       if(!ok) return;
     }
     targetSlots = allSlots;
@@ -5625,7 +5913,7 @@ function asgSubmitAssign(){
   Promise.all(targetSlots.map(slot=>
     fetch(assignmentScriptUrl, {
       method:'POST', mode:'no-cors', headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'assignTask', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot, employees, task, groupTag })
+      body: JSON.stringify({ action:'assignTask', sheetId:assignmentSheetId, token:asgSessionToken, section:asgActiveSection, date, slot, employees, task, groupTag, subSections, attendanceTime })
     })
   )).then(()=>{
     if(!workDone){ closeAsgAssignModal(); setTimeout(asgLoadDate, 800); return; }
@@ -5649,7 +5937,7 @@ function asgPrintDate(){
     const byTag = {};
     inSlot.forEach(r=>{
       const key = r.groupTag || ('_solo_'+r.employee);
-      if(!byTag[key]) byTag[key] = { names: [], task: r.task, workDone: [] };
+      if(!byTag[key]) byTag[key] = { names: [], task: r.task, workDone: [], assignedBy: r.assignedBy || '' };
       byTag[key].names.push(r.employee);
       if(r.workDone) byTag[key].workDone.push(`${r.employee}: ${r.workDone}`);
     });
@@ -5657,18 +5945,24 @@ function asgPrintDate(){
       rows += `<tr><td style="border:1px solid #000; padding:5px;">${slot}</td>
         <td style="border:1px solid #000; padding:5px;">${g.names.join(', ')}</td>
         <td style="border:1px solid #000; padding:5px;">${g.task||'-'}</td>
-        <td style="border:1px solid #000; padding:5px;">${g.workDone.join('; ')||'-'}</td></tr>`;
+        <td style="border:1px solid #000; padding:5px;">${g.workDone.join('; ')||'-'}</td>
+        <td style="border:1px solid #000; padding:5px;">${g.assignedBy||'-'}</td></tr>`;
     });
   });
   document.getElementById('asgPrintArea').innerHTML = `
-    <h2 style="text-align:center;">Assignment / Duties Register</h2>
-    <div style="text-align:center; margin-bottom:10px;">${asgActiveSection} — ${date}</div>
+    <h2 style="text-align:center; margin-bottom:2px;">Assignment / Duties Register</h2>
+    <div style="text-align:center; margin-bottom:14px;">${asgActiveSection} — ${date}</div>
+    <div style="margin-bottom:10px; font-size:14px;"><b>To:</b> I/C DMIS, SNGPL Faisalabad-D</div>
     <table style="width:100%; border-collapse:collapse; font-size:13px;">
       <thead><tr>
         <th style="border:1px solid #000; padding:5px;">Slot</th><th style="border:1px solid #000; padding:5px;">Employee(s)</th>
         <th style="border:1px solid #000; padding:5px;">Task</th><th style="border:1px solid #000; padding:5px;">Work Done</th>
-      </tr></thead><tbody>${rows || '<tr><td colspan="4" style="border:1px solid #000; padding:5px;">No assignments for this date.</td></tr>'}</tbody>
-    </table>`;
+        <th style="border:1px solid #000; padding:5px;">Assigned By</th>
+      </tr></thead><tbody>${rows || '<tr><td colspan="5" style="border:1px solid #000; padding:5px;">No assignments for this date.</td></tr>'}</tbody>
+    </table>
+    <div style="margin-top:40px; font-size:13.5px;">
+      Technical Officer (Metering) — Name &amp; Signature: ____________________________
+    </div>`;
   document.getElementById('asgPrintModal').classList.add('open');
 }
 function closeAsgPrintModal(){ document.getElementById('asgPrintModal').classList.remove('open'); }
@@ -5681,17 +5975,21 @@ function asgEnrollPerson(){
   if(document.getElementById('asgEnrollSec1').checked) sections.push(ASG_SECTIONS[0]);
   if(document.getElementById('asgEnrollSec2').checked) sections.push(ASG_SECTIONS[1]);
   if(document.getElementById('asgEnrollSec3').checked) sections.push('Gate Entry');
+  if(document.getElementById('asgEnrollSec4').checked) sections.push(ASG_ICDMIS_SECTION);
   const statusEl = document.getElementById('asgEnrollStatus');
   if(!assignmentSheetId || !assignmentScriptUrl){ statusEl.textContent = '⚠ Save the Sheet ID / Script URL above first.'; return; }
   if(!personLabel){ statusEl.textContent = 'Enter a person label.'; return; }
   if(sections.length===0){ statusEl.textContent = 'Select at least one allowed section.'; return; }
+  if(sections.indexOf(ASG_ICDMIS_SECTION)!==-1 && role.toLowerCase()!=='i/c dmis'){
+    if(!confirm('You ticked "I/C DMIS Office" but the Role field isn\'t exactly "I/C DMIS" — this person will NOT actually get access to it until Role matches exactly. Continue enrolling anyway?')) return;
+  }
   statusEl.textContent = 'Enrolling…';
   jsonpRequest(assignmentScriptUrl, { action:'enrollPerson', authSheetId, personLabel, role, allowedSections:sections.join(',') }).then(data=>{
     if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Could not enroll.'); return; }
     statusEl.textContent = '✓ Enrolled.';
     document.getElementById('asgEnrollLabel').value=''; document.getElementById('asgEnrollRole').value='';
     document.getElementById('asgEnrollSec1').checked=false; document.getElementById('asgEnrollSec2').checked=false;
-    document.getElementById('asgEnrollSec3').checked=false;
+    document.getElementById('asgEnrollSec3').checked=false; document.getElementById('asgEnrollSec4').checked=false;
     document.getElementById('asgEnrollSecretText').textContent = data.secret;
     document.getElementById('asgEnrollResultModal').classList.add('open');
     const canvas = document.getElementById('asgEnrollQrCanvas');
@@ -5768,9 +6066,12 @@ function showGateTab(name){
   document.getElementById('gateTabStaff').style.display = name==='staff' ? 'block' : 'none';
   document.getElementById('gateTabVisitors').style.display = name==='visitors' ? 'block' : 'none';
   document.getElementById('gateTabMaterial').style.display = name==='material' ? 'block' : 'none';
+  document.getElementById('gateTabChits').style.display = name==='chits' ? 'block' : 'none';
   document.getElementById('gateTabBtnStaff').classList.toggle('active', name==='staff');
   document.getElementById('gateTabBtnVisitors').classList.toggle('active', name==='visitors');
   document.getElementById('gateTabBtnMaterial').classList.toggle('active', name==='material');
+  document.getElementById('gateTabBtnChits').classList.toggle('active', name==='chits');
+  if(name==='chits') gateInitChitsTab();
   window.scrollTo({top:0, behavior:'smooth'});
 }
 
@@ -5794,7 +6095,7 @@ function gateLogin(){
     if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Login failed.'); return; }
     if(data.allowedSections.indexOf('Gate Entry')===-1){ statusEl.textContent = '⚠ This account is not granted Gate Entry access — ask the owner to add it.'; return; }
     gateSessionToken = data.token;
-    gateSession = { personLabel, role: data.role };
+    gateSession = { personLabel, role: data.role, allowedSections: data.allowedSections };
     document.getElementById('gateLoginCode').value = '';
     statusEl.textContent = '';
     gateRenderWorkView();
@@ -5820,13 +6121,29 @@ function gateLoadAll(){
   gateLoadVisitorsToday();
   gateLoadMaterialToday();
 }
+let gateActiveSubSection = null;
+let gatePendingPrintAction = null;
 function gateLoadRosterAll(){
   jsonpRequest(assignmentScriptUrl, { action:'getRosterBoth', sheetId:assignmentSheetId, token:gateSessionToken, section:'Gate Entry' }).then(data=>{
     const a = ((data && data.inspectionFlow) || []).map(r=>({ name:r.name, subSection:r.subSection }));
     const b = ((data && data.mrMrvMir) || []).map(r=>({ name:r.name, subSection:r.subSection }));
-    gateRosterAll = a.concat(b);
+    const ic = ((data && data.icDmisOffice) || []).map(r=>({ name:r.name, subSection:'I/C DMIS Office' }));
+    gateRosterAll = a.concat(b).concat(ic);
+    gateRenderSubSectionTabs();
     gateRenderStaffList();
   }).catch(()=>{});
+}
+function gateRenderSubSectionTabs(){
+  const wrap = document.getElementById('gateSubSectionTabs');
+  const subSections = [...new Set(gateRosterAll.map(r=>r.subSection).filter(Boolean))];
+  if(!gateActiveSubSection || subSections.indexOf(gateActiveSubSection)===-1) gateActiveSubSection = subSections[0] || null;
+  wrap.innerHTML = subSections.map(s=>
+    `<button type="button" class="${s===gateActiveSubSection?'selected':''}" onclick="gateSelectSubSection('${s.replace(/'/g,"\\'")}')">${s}</button>`).join('');
+}
+function gateSelectSubSection(s){
+  gateActiveSubSection = s;
+  gateRenderSubSectionTabs();
+  gateRenderStaffList();
 }
 
 /* ---------- Staff In/Out ---------- */
@@ -5842,21 +6159,35 @@ function gateDetermineNextAction(row){
   if(!row.slot3Out) return {direction:'out', slotIndex:3};
   return null;
 }
+function gateGetCurrentOutInfo(row, next){
+  if(!next || next.direction!=='in') return null;
+  if(next.slotIndex===2) return {time: row.slot1Out, reason: row.slot1Reason};
+  if(next.slotIndex===3) return {time: row.slot2Out, reason: row.slot2Reason};
+  return null;
+}
 function gateRenderStaffList(){
   const wrap = document.getElementById('gateStaffList');
-  if(gateRosterAll.length===0){ wrap.innerHTML = '<div class="subtext">No roster yet — add names from Assignment/Duties → Roster (shared with Gate Entry).</div>'; return; }
-  wrap.innerHTML = gateRosterAll.map(r=>{
+  const filtered = gateActiveSubSection ? gateRosterAll.filter(r=>r.subSection===gateActiveSubSection) : gateRosterAll;
+  if(filtered.length===0){ wrap.innerHTML = '<div class="subtext">No one on this sub-section\'s roster yet — add names from Assignment/Duties → Roster (shared with Gate Entry).</div>'; return; }
+  wrap.innerHTML = filtered.map(r=>{
     const row = gateFindStaffRow(r.name);
     const next = gateDetermineNextAction(row);
     const statusColor = !row || !row.slot1In ? 'var(--muted)' : (next===null ? 'var(--ok)' : (next.direction==='out' ? 'var(--ok)' : 'var(--warn)'));
-    const statusText = !row || !row.slot1In ? 'Not arrived' : (next===null ? 'Day complete' : (next.direction==='out' ? 'Currently IN' : 'Currently OUT'));
+    let statusText;
+    if(!row || !row.slot1In) statusText = 'Not arrived';
+    else if(next===null) statusText = 'Day complete';
+    else if(next.direction==='out') statusText = 'Currently IN';
+    else {
+      const outInfo = gateGetCurrentOutInfo(row, next);
+      statusText = outInfo && outInfo.time ? `Out since ${outInfo.time} — ${outInfo.reason || 'no reason given'}` : 'Currently OUT';
+    }
     const hoursText = row && row.availableHours ? ` · ${row.availableHours} available` : '';
     const btnLabel = next===null ? 'Done' : (next.direction==='in' ? '↩ Check In' : '↪ Check Out');
     return `<div class="pc-cloud" style="margin:0 0 8px;">
       <div class="row" style="align-items:center; margin:0;">
         <div style="flex:1;">
           <div class="pc-name" style="font-size:15px;">${r.name}</div>
-          <div class="pc-meta">${r.subSection||''} · <span style="color:${statusColor}; font-weight:700;">${statusText}</span>${hoursText}</div>
+          <div class="pc-meta"><span style="color:${statusColor}; font-weight:700;">${statusText}</span>${hoursText}</div>
         </div>
         <button class="btn ${next && next.direction==='in' ? 'amber' : 'outline'} small" style="flex:0 0 auto; width:auto;" ${next===null?'disabled':''} onclick="gateHandleStaffTap('${r.name.replace(/'/g,"\\'")}','${(r.subSection||'').replace(/'/g,"\\'")}')">${btnLabel}</button>
       </div>
@@ -6053,6 +6384,140 @@ function gateHandleMaterialOut(sr){
   }).then(()=>{ setTimeout(gateLoadMaterialToday, 800); }).catch(()=>{ alert('Could not send.'); });
 }
 
+/* ---------- Gate Pass Chits — printed QR slips, one Out + one In, then void ---------- */
+let gateChitBatch = [];
+let gateChitRoster = [];
+let gateChitTeams = [];
+function gateInitChitsTab(){
+  const isIssuer = isChitIssuerRoleClient(gateSession.role);
+  document.getElementById('gateChitsNotAllowed').style.display = isIssuer ? 'none' : 'block';
+  document.getElementById('gateChitsFormBlock').style.display = isIssuer ? 'block' : 'none';
+  if(!isIssuer) return;
+  const sections = (gateSession.allowedSections || []).filter(s => s === 'Inspection & Flow Proving' || s === 'MR/MRV & MIR');
+  document.getElementById('gateChitSectionChips').innerHTML = sections.map((s,i)=>
+    `<button type="button" class="${i===0?'selected':''}" onclick="gateSelectChitSection('${s.replace(/'/g,"\\'")}')">${s}</button>`).join('');
+  if(sections.length) gateSelectChitSection(sections[0]);
+}
+function isChitIssuerRoleClient(role){
+  const r = String(role||'').trim().toLowerCase();
+  return r==='technical officer (metering)' || r==='to (metering)' || r==='i/c dmis';
+}
+function gateSelectChitSection(section){
+  document.querySelectorAll('#gateChitSectionChips button').forEach(b=>b.classList.toggle('selected', b.textContent===section));
+  const subOpts = ASG_SUB_SECTIONS[section] || [];
+  document.getElementById('gateChitSubSectionChips').innerHTML = subOpts.map((s,i)=>
+    `<button type="button" class="${i===0?'selected':''}" onclick="gateSelectChitSubSection('${section.replace(/'/g,"\\'")}','${s.replace(/'/g,"\\'")}')">${s}</button>`).join('');
+  if(subOpts.length) gateSelectChitSubSection(section, subOpts[0]);
+}
+function gateSelectChitSubSection(section, subSection){
+  document.querySelectorAll('#gateChitSubSectionChips button').forEach(b=>b.classList.toggle('selected', b.textContent===subSection));
+  jsonpRequest(assignmentScriptUrl, { action:'getRoster', sheetId:assignmentSheetId, token:gateSessionToken, section }).then(data=>{
+    gateChitRoster = ((data && data.roster) || []).filter(r=>r.subSection===subSection);
+    gateRenderChitTargetChips();
+  }).catch(()=>{});
+  jsonpRequest(assignmentScriptUrl, { action:'getTeams', sheetId:assignmentSheetId, token:gateSessionToken, section }).then(data=>{
+    gateChitTeams = (data && data.teams) || [];
+    gateRenderChitTargetChips();
+  }).catch(()=>{});
+}
+function gateRenderChitTargetChips(){
+  const type = getToggleVal('gateChitTypeChoice') || 'individual';
+  document.getElementById('gateChitTargetLabel').textContent = type==='team' ? 'Team' : 'Employee';
+  const options = type==='team' ? gateChitTeams.map(t=>t.teamName) : gateChitRoster.map(r=>r.name);
+  document.getElementById('gateChitTargetChips').innerHTML = options.map((o,i)=>
+    `<button type="button" class="${i===0?'selected':''}" onclick="[...this.parentElement.children].forEach(b=>b.classList.remove('selected')); this.classList.add('selected');">${o}</button>`).join('')
+    || '<div class="subtext">Nothing here yet for this sub-section.</div>';
+}
+function gateGenerateChit(){
+  const section = document.querySelector('#gateChitSectionChips button.selected');
+  const subSection = document.querySelector('#gateChitSubSectionChips button.selected');
+  const type = getToggleVal('gateChitTypeChoice') || 'individual';
+  const target = document.querySelector('#gateChitTargetChips button.selected');
+  const purpose = getToggleVal('gateChitPurposeChoice') || 'Personal';
+  const statusEl = document.getElementById('gateChitStatus');
+  if(!section || !subSection || !target){ statusEl.textContent = 'Select a section, sub-section, and who this chit is for.'; return; }
+  statusEl.textContent = 'Generating…';
+  const payload = { action:'generateChit', sheetId:assignmentSheetId, token:gateSessionToken,
+    section:section.textContent, subSection:subSection.textContent, type, purpose:purpose };
+  if(type==='team'){
+    const team = gateChitTeams.find(t=>t.teamName===target.textContent);
+    payload.names = (team ? team.members : []).join(',');
+  } else {
+    payload.employeeName = target.textContent;
+  }
+  jsonpRequest(assignmentScriptUrl, payload).then(data=>{
+    if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Could not generate.'); return; }
+    gateChitBatch.push({
+      chitId: data.chitId, section: section.textContent, subSection: subSection.textContent,
+      type, names: type==='team' ? (payload.names||'').split(',').join(', ') : target.textContent, purpose
+    });
+    statusEl.textContent = `✓ Added chit for ${target.textContent}.`;
+    document.getElementById('gateChitBatchCount').textContent = `${gateChitBatch.length} chit(s) queued for printing.`;
+  }).catch(()=>{ statusEl.textContent = '⚠ Could not reach the server.'; });
+}
+function gateClearChitBatch(){
+  if(gateChitBatch.length && !confirm('Clear all queued chits? Already-generated chits stay valid — this only clears what\'s waiting to print.')) return;
+  gateChitBatch = [];
+  document.getElementById('gateChitBatchCount').textContent = 'No chits queued yet.';
+}
+function gateOpenChitPrintView(){
+  if(gateChitBatch.length===0){ alert('No chits queued — generate at least one first.'); return; }
+  const baseUrl = window.location.origin + window.location.pathname;
+  let html = '<div style="display:flex; flex-direction:column; gap:6px;">';
+  gateChitBatch.forEach((c,i)=>{
+    html += `<div style="display:flex; align-items:center; border:1px dashed #999; padding:8px; min-height:50mm; box-sizing:border-box; page-break-inside:avoid;">
+      <canvas id="gateChitQr${i}" style="width:110px; height:110px; flex:0 0 auto;"></canvas>
+      <div style="flex:1; padding-left:16px; font-size:12.5px; line-height:1.7;">
+        <div><b>${c.type==='team'?'Team':'Employee'}:</b> ${c.names}</div>
+        <div><b>Purpose:</b> ${c.purpose}</div>
+        <div><b>Section:</b> ${c.subSection}</div>
+        <div style="margin-top:8px;">Signed: Technical Officer (Metering) ____________________</div>
+      </div>
+    </div>`;
+  });
+  html += '</div>';
+  document.getElementById('gateChitPrintArea').innerHTML = html;
+  document.getElementById('gateChitPrintModal').classList.add('open');
+  gateChitBatch.forEach((c,i)=>{
+    const canvas = document.getElementById('gateChitQr'+i);
+    const url = baseUrl + '?gateChit=' + c.chitId;
+    if(window.QRCode) QRCode.toCanvas(canvas, url, { width:110, margin:2, errorCorrectionLevel:'L' }, ()=>{});
+  });
+}
+function closeGateChitPrintModal(){ document.getElementById('gateChitPrintModal').classList.remove('open'); }
+
+/* ---------- No-login chit scan landing — the ONLY unauthenticated write path in this app,
+   deliberately narrow: it can only move the exact people named on that one chit, exactly
+   twice, ever. ---------- */
+function gateHandleChitScanIfPresent(){
+  const params = new URLSearchParams(window.location.search);
+  const chitId = params.get('gateChit');
+  if(!chitId) return false;
+  if(!assignmentSheetId){
+    document.body.innerHTML = '<div style="padding:40px; text-align:center; font-family:sans-serif;">This device has no Assignment Sheet configured — ask the DMIS office to set it up here once, then this pass will work.</div>';
+    return true;
+  }
+  document.getElementById('homeScreen').style.display = 'none';
+  document.getElementById('gateChitScanScreen').style.display = 'block';
+  jsonpRequest(assignmentScriptUrl, { action:'scanChit', sheetId:assignmentSheetId, chitId }).then(data=>{
+    const el = document.getElementById('gateChitScanResult');
+    if(!data || data.status!=='ok'){
+      el.innerHTML = `<div style="color:var(--warn); font-weight:700;">⚠ ${ (data&&data.message) || 'Could not process this pass.' }</div>`;
+      return;
+    }
+    const lines = data.results.map(r=>{
+      if(r.skipped) return `${r.employee}: already fully checked in/out for today — nothing to do.`;
+      return `${r.employee}: checked ${r.direction.toUpperCase()} at ${r.time}`;
+    }).join('<br>');
+    el.innerHTML = `<div style="color:var(--ok); font-weight:700; font-size:20px;">✓ ${data.direction==='out'?'OUT':'IN'}</div>
+      <div style="margin-top:10px;">${lines}</div>
+      <div class="subtext" style="margin-top:14px;">${data.subSection} · ${data.section}</div>`;
+  }).catch(()=>{
+    document.getElementById('gateChitScanResult').innerHTML = '<div style="color:var(--warn);">⚠ Could not reach the server — check your connection and try scanning again.</div>';
+  });
+  return true;
+}
+
 /* ---------- Shared camera (visitor + material photos) ---------- */
 function openGateCamera(target){
   gateCameraTarget = target;
@@ -6126,6 +6591,70 @@ function gateStartRecording(){
   }, 1000);
 }
 
+/* ---------- Printing — always re-confirms the Authenticator code first, even though
+   already signed in, since a printed sheet is an official document. ---------- */
+function gatePrintSection(){
+  gatePendingPrintAction = 'section';
+  document.getElementById('gateReauthCode').value = '';
+  document.getElementById('gateReauthStatus').textContent = '';
+  document.getElementById('gateReauthModal').classList.add('open');
+}
+function gatePrintAllStaff(){
+  gatePendingPrintAction = 'all';
+  document.getElementById('gateReauthCode').value = '';
+  document.getElementById('gateReauthStatus').textContent = '';
+  document.getElementById('gateReauthModal').classList.add('open');
+}
+function closeGateReauthModal(){ document.getElementById('gateReauthModal').classList.remove('open'); gatePendingPrintAction = null; }
+function gateSubmitReauth(){
+  const code = document.getElementById('gateReauthCode').value.trim();
+  const statusEl = document.getElementById('gateReauthStatus');
+  if(!code){ statusEl.textContent = 'Enter your 6-digit code.'; return; }
+  statusEl.textContent = 'Checking…';
+  jsonpRequest(assignmentScriptUrl, { action:'verifyTotp', authSheetId, personLabel:gateSession.personLabel, code }).then(data=>{
+    if(!data || data.status!=='ok'){ statusEl.textContent = '⚠ ' + ((data&&data.message)||'Incorrect code.'); return; }
+    document.getElementById('gateReauthModal').classList.remove('open');
+    if(gatePendingPrintAction==='section') gateRenderPrintView(false);
+    else if(gatePendingPrintAction==='all') gateRenderPrintView(true);
+    gatePendingPrintAction = null;
+  }).catch(()=>{ statusEl.textContent = '⚠ Could not reach the server — check your connection.'; });
+}
+function gateRenderPrintView(allSections){
+  const date = document.getElementById('gateDate').value;
+  const list = allSections ? gateRosterAll : gateRosterAll.filter(r=>r.subSection===gateActiveSubSection);
+  const rows = list.map(r=>{
+    const row = gateFindStaffRow(r.name);
+    const next = gateDetermineNextAction(row);
+    let status;
+    if(!row || !row.slot1In) status = 'Not arrived';
+    else if(next===null) status = 'Day complete';
+    else if(next.direction==='out') status = 'Currently IN';
+    else { const o = gateGetCurrentOutInfo(row, next); status = o && o.time ? `Out since ${o.time} — ${o.reason||''}` : 'Currently OUT'; }
+    return `<tr>
+      <td style="border:1px solid #000; padding:5px;">${r.name}</td>
+      <td style="border:1px solid #000; padding:5px;">${r.subSection||''}</td>
+      <td style="border:1px solid #000; padding:5px;">${row ? (row.slot1In||'') : ''}</td>
+      <td style="border:1px solid #000; padding:5px;">${status}</td>
+      <td style="border:1px solid #000; padding:5px;">${row ? (row.availableHours||'') : ''}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('gatePrintArea').innerHTML = `
+    <h2 style="text-align:center; margin-bottom:2px;">DMIS Gate Entry — Staff Register</h2>
+    <div style="text-align:center; margin-bottom:14px;">${allSections ? 'All Sections' : gateActiveSubSection} — ${date}</div>
+    <table style="width:100%; border-collapse:collapse; font-size:13px;">
+      <thead><tr>
+        <th style="border:1px solid #000; padding:5px;">Name</th><th style="border:1px solid #000; padding:5px;">Sub-Section</th>
+        <th style="border:1px solid #000; padding:5px;">First In</th><th style="border:1px solid #000; padding:5px;">Status</th>
+        <th style="border:1px solid #000; padding:5px;">Available Hours</th>
+      </tr></thead><tbody>${rows || '<tr><td colspan="5" style="border:1px solid #000; padding:5px;">No staff on this roster.</td></tr>'}</tbody>
+    </table>
+    <div style="margin-top:40px; font-size:13.5px;">
+      Technical Officer (Metering) — Name &amp; Signature: ____________________________
+    </div>`;
+  document.getElementById('gatePrintModal').classList.add('open');
+}
+function closeGatePrintModal(){ document.getElementById('gatePrintModal').classList.remove('open'); }
+
 updateReadout();
 (function initFromUrl(){
   const params = new URLSearchParams(window.location.search);
@@ -6147,7 +6676,7 @@ updateReadout();
     if(savedScriptUrl) document.getElementById('asgScriptUrlInput').value = savedScriptUrl;
   } catch(e){}
 })();
-goHome();
+if(!gateHandleChitScanIfPresent()){ goHome(); }
 </script>
 </body>
 </html>
