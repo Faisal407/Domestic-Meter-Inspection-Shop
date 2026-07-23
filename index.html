@@ -3575,6 +3575,7 @@ function grantAccessToDevice(id){
 // Returns a Promise resolving to {allowed, paused, reason}. Unrestricted projects always resolve allowed.
 function checkAccessForProject(p){
   if(!p.restrictedAccess) return Promise.resolve({allowed:true, paused:false});
+  if(p.role === 'admin') return Promise.resolve({allowed:true, paused:false}); // never lock the admin out of their own project
   if(!registryScriptUrl || !registrySheetId || !p.device){
     return Promise.resolve({allowed:false, paused:false, reason:'Registry or device name not set.'});
   }
@@ -5218,6 +5219,7 @@ function lpGrantAccessToDevice(id){
 }
 function lpCheckAccessForProject(p){
   if(!p.restrictedAccess) return Promise.resolve({allowed:true, paused:false});
+  if(p.role === 'admin') return Promise.resolve({allowed:true, paused:false}); // never lock the admin out of their own project
   if(!registryScriptUrl || !registrySheetId || !p.device){
     return Promise.resolve({allowed:false, paused:false, reason:'Registry or device name not set.'});
   }
