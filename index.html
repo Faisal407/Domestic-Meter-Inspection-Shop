@@ -1837,6 +1837,7 @@ function putSession(token, sess) {
    the one-time secret shown at enrollment.
    ============================================================ */
 function getAuthSheet(sheetId) {
+  if (!sheetId) throw new Error('Auth Sheet ID is missing — check Manage Access has it filled in and saved.');
   var ss = SpreadsheetApp.openById(sheetId);
   var sheet = ss.getSheetByName('Auth');
   if (!sheet) {
@@ -1862,43 +1863,57 @@ function enrollPerson(data) {
     sheet.appendRow([data.personLabel, data.role || '', secret, new Date(), 'Active', allowed]);
     var uri = 'otpauth://totp/DMIS:' + encodeURIComponent(data.personLabel) + '?secret=' + secret + '&issuer=DMIS&algorithm=SHA1&digits=6&period=30';
     return { status: 'ok', secret: secret, otpauthUri: uri };
+  } catch (err) {
+    return { status: 'error', message: 'Could not enroll: ' + err.message };
   } finally { lock.releaseLock(); }
 }
 function revokePerson(data) {
-  var sheet = getAuthSheet(data.authSheetId);
-  var vals = sheet.getDataRange().getValues();
-  for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
-      sheet.getRange(i+1, 5).setValue('Revoked');
-      return { status: 'ok' };
+  try {
+    var sheet = getAuthSheet(data.authSheetId);
+    var vals = sheet.getDataRange().getValues();
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
+        sheet.getRange(i+1, 5).setValue('Revoked');
+        return { status: 'ok' };
+      }
     }
+    return { status: 'error', message: 'Person not found.' };
+  } catch (err) {
+    return { status: 'error', message: 'Could not revoke: ' + err.message };
   }
-  return { status: 'error', message: 'Person not found.' };
 }
 function listAuthPeople(authSheetId) {
-  var sheet = getAuthSheet(authSheetId);
-  var vals = sheet.getDataRange().getValues();
-  var list = [];
-  for (var i = 1; i < vals.length; i++) {
-    if (!vals[i][0]) continue;
-    list.push({ personLabel: vals[i][0], role: vals[i][1], enrolledAt: vals[i][3], status: vals[i][4], allowedSections: vals[i][5] });
+  try {
+    var sheet = getAuthSheet(authSheetId);
+    var vals = sheet.getDataRange().getValues();
+    var list = [];
+    for (var i = 1; i < vals.length; i++) {
+      if (!vals[i][0]) continue;
+      list.push({ personLabel: vals[i][0], role: vals[i][1], enrolledAt: vals[i][3], status: vals[i][4], allowedSections: vals[i][5] });
+    }
+    return { people: list };
+  } catch (err) {
+    return { status: 'error', message: 'Could not list people: ' + err.message, people: [] };
   }
-  return { people: list };
 }
 function verifyTotpLogin(data) {
-  var sheet = getAuthSheet(data.authSheetId);
-  var vals = sheet.getDataRange().getValues();
-  for (var i = 1; i < vals.length; i++) {
-    if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
-      if (vals[i][4] !== 'Active') return { status: 'error', message: 'This person\'s access has been revoked.' };
-      if (!verifyTotpCode(vals[i][2], data.code)) return { status: 'error', message: 'Incorrect or expired code.' };
-      var allowedSections = String(vals[i][5] || '').split(',').map(function(s){ return s.trim(); }).filter(Boolean);
-      var token = makeToken();
-      putSession(token, { personLabel: vals[i][0], role: vals[i][1], allowedSections: allowedSections });
-      return { status: 'ok', token: token, allowedSections: allowedSections, role: vals[i][1] };
+  try {
+    var sheet = getAuthSheet(data.authSheetId);
+    var vals = sheet.getDataRange().getValues();
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][0]).trim().toLowerCase() === String(data.personLabel).trim().toLowerCase()) {
+        if (vals[i][4] !== 'Active') return { status: 'error', message: 'This person\'s access has been revoked.' };
+        if (!verifyTotpCode(vals[i][2], data.code)) return { status: 'error', message: 'Incorrect or expired code.' };
+        var allowedSections = String(vals[i][5] || '').split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+        var token = makeToken();
+        putSession(token, { personLabel: vals[i][0], role: vals[i][1], allowedSections: allowedSections });
+        return { status: 'ok', token: token, allowedSections: allowedSections, role: vals[i][1] };
+      }
     }
+    return { status: 'error', message: 'Person label not found — check enrollment.' };
+  } catch (err) {
+    return { status: 'error', message: 'Could not verify: ' + err.message };
   }
-  return { status: 'error', message: 'Person label not found — check enrollment.' };
 }
 
 /* ============================================================
@@ -5544,7 +5559,7 @@ function asgLogin(){
   const personLabel = document.getElementById('asgLoginPerson').value;
   const code = document.getElementById('asgLoginCode').value.trim();
   const statusEl = document.getElementById('asgLoginStatus');
-  if(!assignmentSheetId || !assignmentScriptUrl){ statusEl.textContent = '⚠ Set up the Assignment Sheet/Script in "Manage Access" first.'; return; }
+  if(!assignmentSheetId || !assignmentScriptUrl || !authSheetId){ statusEl.textContent = '⚠ Set up the Assignment Sheet, Auth Sheet, and Script URL in "Manage Access" first.'; return; }
   if(!personLabel || !code){ statusEl.textContent = 'Select your name and enter your 6-digit code.'; return; }
   statusEl.textContent = 'Checking…';
   jsonpRequest(assignmentScriptUrl, { action:'verifyTotp', authSheetId, personLabel, code }).then(data=>{
@@ -5977,7 +5992,7 @@ function asgEnrollPerson(){
   if(document.getElementById('asgEnrollSec3').checked) sections.push('Gate Entry');
   if(document.getElementById('asgEnrollSec4').checked) sections.push(ASG_ICDMIS_SECTION);
   const statusEl = document.getElementById('asgEnrollStatus');
-  if(!assignmentSheetId || !assignmentScriptUrl){ statusEl.textContent = '⚠ Save the Sheet ID / Script URL above first.'; return; }
+  if(!assignmentSheetId || !assignmentScriptUrl || !authSheetId){ statusEl.textContent = '⚠ Save the Assignment Sheet ID, Auth Sheet ID, and Script URL above first — all three are needed.'; return; }
   if(!personLabel){ statusEl.textContent = 'Enter a person label.'; return; }
   if(sections.length===0){ statusEl.textContent = 'Select at least one allowed section.'; return; }
   if(sections.indexOf(ASG_ICDMIS_SECTION)!==-1 && role.toLowerCase()!=='i/c dmis'){
@@ -6010,7 +6025,7 @@ function asgEnrollPerson(){
 }
 function closeAsgEnrollResult(){ document.getElementById('asgEnrollResultModal').classList.remove('open'); }
 function asgLoadPeopleList(){
-  if(!assignmentSheetId || !assignmentScriptUrl) return;
+  if(!assignmentSheetId || !assignmentScriptUrl || !authSheetId) return;
   jsonpRequest(assignmentScriptUrl, { action:'listAuthPeople', authSheetId }).then(data=>{
     const people = (data && data.people) || [];
     const wrap = document.getElementById('asgPeopleList');
@@ -6028,6 +6043,7 @@ function asgLoadPeopleList(){
   }).catch(()=>{});
 }
 function asgRevokePerson(personLabel){
+  if(!authSheetId || !assignmentScriptUrl){ alert('Auth Sheet ID / Script URL not set up.'); return; }
   if(!confirm(`Revoke access for "${personLabel}"? They won't be able to log in again until re-enrolled.`)) return;
   jsonpRequest(assignmentScriptUrl, { action:'revokePerson', authSheetId, personLabel }).then(()=>{
     asgLoadPeopleList(); asgLoadPeopleListForLogin();
