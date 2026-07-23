@@ -3091,6 +3091,7 @@ function goHome(){
   document.getElementById('listPrepShell').style.display = 'none';
   document.getElementById('assignmentShell').style.display = 'none';
   document.getElementById('gateShell').style.display = 'none';
+  if(typeof gateStaffRefreshInterval !== 'undefined' && gateStaffRefreshInterval){ clearInterval(gateStaffRefreshInterval); gateStaffRefreshInterval = null; }
   window.scrollTo({top:0, behavior:'smooth'});
 }
 function showLpTab(name){
@@ -6136,6 +6137,7 @@ function gateInit(){
   if(authSheetId) gateLoadPeopleListForLogin();
   showGateTab('staff');
 }
+let gateStaffRefreshInterval = null;
 function showGateTab(name){
   document.getElementById('gateTabStaff').style.display = name==='staff' ? 'block' : 'none';
   document.getElementById('gateTabVisitors').style.display = name==='visitors' ? 'block' : 'none';
@@ -6146,6 +6148,13 @@ function showGateTab(name){
   document.getElementById('gateTabBtnMaterial').classList.toggle('active', name==='material');
   document.getElementById('gateTabBtnChits').classList.toggle('active', name==='chits');
   if(name==='chits') gateInitChitsTab();
+  // Staff status can now change from a completely separate device (the Gate Pass Scanner app
+  // scanning a chit) — poll while this tab is actually the one being looked at, so that shows up
+  // without needing a manual refresh. Stop polling the moment it's not the visible tab.
+  if(gateStaffRefreshInterval){ clearInterval(gateStaffRefreshInterval); gateStaffRefreshInterval = null; }
+  if(name==='staff' && gateSessionToken){
+    gateStaffRefreshInterval = setInterval(()=>{ if(gateSessionToken) gateLoadStaffToday(); }, 15000);
+  }
   window.scrollTo({top:0, behavior:'smooth'});
 }
 
@@ -6177,6 +6186,7 @@ function gateLogin(){
 }
 function gateLogout(){
   gateSessionToken = null; gateSession = null;
+  if(gateStaffRefreshInterval){ clearInterval(gateStaffRefreshInterval); gateStaffRefreshInterval = null; }
   document.getElementById('gateLoginBlock').style.display = 'block';
   document.getElementById('gateWorkBlock').style.display = 'none';
   document.getElementById('gateTag').textContent = 'Not logged in · SNGPL Faisalabad-D';
