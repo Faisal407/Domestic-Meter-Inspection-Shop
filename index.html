@@ -6623,7 +6623,6 @@ function gateClearChitBatch(){
 }
 function gateOpenChitPrintView(){
   if(gateChitBatch.length===0){ alert('No chits queued — generate at least one first.'); return; }
-  const baseUrl = window.location.origin + window.location.pathname;
   let html = `<style>
     @media print { @page { size: A4 portrait; margin: 10mm; } }
     .gate-chit-sheet { display:flex; flex-direction:column; gap:4mm; }
@@ -6633,9 +6632,11 @@ function gateOpenChitPrintView(){
     .gate-chit-qr-wrap svg { width:100%; height:auto; display:block; }
   </style><div class="gate-chit-sheet">`;
   gateChitBatch.forEach((c)=>{
-    const url = baseUrl + '?gateChit=' + c.chitId;
+    // Deliberately plain text, not a URL — a normal camera app shows inert text with nothing to
+    // tap, so only the dedicated Gate Pass Scanner app (which knows to treat this as a chit ID)
+    // can actually act on it. Encoding a clickable link here would let anyone self-scan.
     html += `<div class="gate-chit-row">
-      <div class="gate-chit-qr-wrap">${generateQrSvg(url, 220)}</div>
+      <div class="gate-chit-qr-wrap">${generateQrSvg(c.chitId, 220)}</div>
       <div style="flex:1; padding-left:16px; font-size:12.5px; line-height:1.7;">
         <div><b>${c.type==='team'?'Team':'Employee'}:</b> ${c.names}</div>
         <div><b>Purpose:</b> ${c.purpose}</div>
@@ -6653,18 +6654,23 @@ function closeGateChitPrintModal(){ document.getElementById('gateChitPrintModal'
 
 /* ---------- No-login chit scan landing — the ONLY unauthenticated write path in this app,
    deliberately narrow: it can only move the exact people named on that one chit, exactly
-   twice, ever. ---------- */
+   twice, ever. The QR itself carries the Sheet ID + Script URL, so this works on literally
+   any scanning device — the point of a physical chit is that it shouldn't need any device
+   to already be set up. Local storage is only a fallback for older chits printed before
+   this was added. ---------- */
 function gateHandleChitScanIfPresent(){
   const params = new URLSearchParams(window.location.search);
   const chitId = params.get('gateChit');
   if(!chitId) return false;
-  if(!assignmentSheetId){
-    document.body.innerHTML = '<div style="padding:40px; text-align:center; font-family:sans-serif;">This device has no Assignment Sheet configured — ask the DMIS office to set it up here once, then this pass will work.</div>';
+  const chitSheetId = params.get('sheetId') || assignmentSheetId;
+  const chitScriptUrl = params.get('scriptUrl') || assignmentScriptUrl;
+  if(!chitSheetId || !chitScriptUrl){
+    document.body.innerHTML = '<div style="padding:40px; text-align:center; font-family:sans-serif;">This pass is missing its Sheet details — it may have been printed before this feature was added. Ask your Technical Officer to print a fresh one.</div>';
     return true;
   }
   document.getElementById('homeScreen').style.display = 'none';
   document.getElementById('gateChitScanScreen').style.display = 'block';
-  jsonpRequest(assignmentScriptUrl, { action:'scanChit', sheetId:assignmentSheetId, chitId }).then(data=>{
+  jsonpRequest(chitScriptUrl, { action:'scanChit', sheetId:chitSheetId, chitId }).then(data=>{
     const el = document.getElementById('gateChitScanResult');
     if(!data || data.status!=='ok'){
       el.innerHTML = `<div style="color:var(--warn); font-weight:700;">⚠ ${ (data&&data.message) || 'Could not process this pass.' }</div>`;
